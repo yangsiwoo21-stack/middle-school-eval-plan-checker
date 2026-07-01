@@ -197,7 +197,11 @@ def split_combined_subject_document(document: Document) -> list[Document]:
                 None,
                 grade=infer_grade(document.path, chunk) or document.grade,
                 subject=marker.subject,
-                table_rows=table_rows_for_text(document.table_rows, chunk),
+                # HWPX table rows do not carry reliable text offsets here.
+                # Fuzzy row matching can mix another subject's rubric into this
+                # virtual subject document, so use text extraction for combined
+                # files until section-aware table mapping is available.
+                table_rows=[],
             )
         )
     return documents or [document]
@@ -1292,6 +1296,11 @@ def extract_basic_score_rows(section: str) -> list[tuple[int, int, str, str]]:
         start = marker.start()
         end = markers[index + 1].start() if index + 1 < len(markers) else len(section)
         block = section[start:end]
+        explicit_basic = extract_overall_basic_score_from_block(block)
+        if explicit_basic is not None:
+            rows.append((full_score, explicit_basic, block[:1600], "기본점수"))
+            continue
+
         basic_index = block.find("기본점수")
         if basic_index < 0:
             continue
@@ -1322,6 +1331,20 @@ def extract_basic_score_rows(section: str) -> list[tuple[int, int, str, str]]:
             continue
         rows.append((full_score, basic_score, block[:1600], "기본점수"))
     return rows
+
+
+def extract_overall_basic_score_from_block(block: str) -> int | None:
+    cleaned = clean_cell(block)
+    patterns = [
+        r"기본점수\s*\(\s*백지[^)]{0,40}포함\s*\)\s*(?:\||\s)+(\d{1,3})(?=\s*(?:\||자발|장기|$))",
+        r"기본점수\s*\(\s*백지[^)]{0,40}\)\s*(?:\||\s)+(\d{1,3})(?=\s*(?:\||자발|장기|$))",
+        r"(?:^|\|)\s*기본점수\s*(?:\||\s)+(\d{1,3})(?=\s*(?:\||자발|장기|$))",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def performance_area_scores_from_ratio(rows: list[list[str]]) -> dict[str, int]:
