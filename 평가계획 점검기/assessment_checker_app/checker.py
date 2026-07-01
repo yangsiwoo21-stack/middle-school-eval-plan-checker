@@ -1,0 +1,1609 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import html
+import json
+import re
+import shutil
+import zipfile
+
+
+CODE_RE = re.compile(r"\[[0-9][^\]\s]{1,20}\]")
+PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+POINT_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*점\s*\(\s*(\d+(?:\.\d+)?)\s*%\s*\)")
+
+SUBJECTS = [
+    "기술가정",
+    "기술과",
+    "국어",
+    "도덕",
+    "사회",
+    "역사",
+    "수학",
+    "과학",
+    "체육",
+    "음악",
+    "미술",
+    "영어",
+    "한문",
+    "정보",
+]
+
+
+@dataclass
+class ReviewFinding:
+    file_path: Path
+    grade: int | None
+    subject: str | None
+    severity: str
+    topic: str
+    anchor_text: str
+    memo_text: str
+    context: str
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        return {
+            "file_path": str(self.file_path),
+            "grade": self.grade,
+            "subject": self.subject,
+            "severity": self.severity,
+            "topic": self.topic,
+            "anchor_text": self.anchor_text,
+            "memo_text": self.memo_text,
+            "context": self.context,
+        }
+
+
+@dataclass(frozen=True)
+class GradePolicy:
+    grade: int | None
+    curriculum: str
+    is_grade1: bool
+    is_free_semester: bool
+    skip_regular_exam_checks: bool
+    require_2022_achievement_levels: bool
+
+
+def grade_policy_for(document: "Document") -> GradePolicy:
+    grade = document.grade
+    is_grade1 = grade == 1
+    is_free_semester = is_grade1 and "자유학기" in document.text
+    return GradePolicy(
+        grade=grade,
+        curriculum="2022 개정" if grade in {1, 2} else ("2015 개정" if grade == 3 else "확인 필요"),
+        is_grade1=is_grade1,
+        is_free_semester=is_free_semester,
+        skip_regular_exam_checks=is_free_semester,
+        require_2022_achievement_levels=grade in {1, 2},
+    )
+
+
+class ReviewRunner:
+    def review_file(self, path: Path) -> list[ReviewFinding]:
+        document = Document.from_path(path)
+        findings: list[ReviewFinding] = []
+        for review_document in split_combined_subject_document(document):
+            findings.extend(RuleEngine(review_document).run())
+        return dedupe_findings(findings)
+
+    def review_folder(self, folder: Path) -> list[ReviewFinding]:
+        files = self._discover_documents(folder)
+        findings: list[ReviewFinding] = []
+        for path in files:
+            try:
+                findings.extend(self.review_file(path))
+            except Exception:
+                continue
+        return dedupe_findings(findings)
+
+    def create_memo_copies(self, findings: list[ReviewFinding], out_dir: Path) -> None:
+        if out_dir.exists():
+            clear_directory_contents(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        by_file: dict[Path, list[ReviewFinding]] = {}
+        for finding in findings:
+            if finding.file_path.suffix.lower() == ".hwpx":
+                by_file.setdefault(finding.file_path, []).append(finding)
+        summary = []
+        for src, file_findings in by_file.items():
+            dst = out_dir / f"{src.stem}_메모첨부{src.suffix}"
+            try:
+                result = HwpxMemoWriter.copy_with_memos(src, dst, file_findings)
+            except PermissionError:
+                dst = next_available_path(out_dir / f"{src.stem}_메모첨부_새로생성{src.suffix}")
+                result = HwpxMemoWriter.copy_with_memos(src, dst, file_findings)
+            summary.append(result)
+        (out_dir / "memo_creation_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _discover_documents(self, folder: Path) -> list[Path]:
+        paths: list[Path] = []
+        for suffix in ("*.hwpx", "*.md"):
+            paths.extend(folder.rglob(suffix))
+        # Prefer HWPX when matching MD exists.
+        hwpx_stems = {p.with_suffix("").name for p in paths if p.suffix.lower() == ".hwpx"}
+        filtered = []
+        for path in paths:
+            if path.suffix.lower() == ".md" and path.with_suffix("").name in hwpx_stems:
+                continue
+            filtered.append(path)
+        return sorted(filtered)
+
+
+class Document:
+    def __init__(
+        self,
+        path: Path,
+        text: str,
+        section_xml: str | None = None,
+        *,
+        grade: int | None = None,
+        subject: str | None = None,
+        table_rows: list[list[str]] | None = None,
+    ) -> None:
+        self.path = path
+        self.text = normalize_text(text)
+        self.section_xml = section_xml
+        self.table_rows = table_rows if table_rows is not None else (extract_hwpx_table_rows(section_xml) if section_xml else [])
+        self.grade = grade if grade is not None else infer_grade(path, self.text)
+        self.subject = subject if subject is not None else infer_subject(path, self.text)
+
+    @classmethod
+    def from_path(cls, path: Path) -> "Document":
+        if path.suffix.lower() == ".hwpx":
+            section_xml = read_hwpx_section(path)
+            section_xml = HwpxMemoWriter.strip_existing_memos(section_xml)
+            text = extract_visible_text(section_xml)
+            md_path = path.with_suffix(".md")
+            if md_path.exists():
+                md_text = read_text_file(md_path)
+                if md_text.strip():
+                    text = md_text
+            return cls(path, text, section_xml)
+        return cls(path, read_text_file(path), None)
+
+    def around(self, needle: str, radius: int = 500) -> str:
+        idx = self.text.find(needle)
+        if idx < 0:
+            return self.text[: radius * 2]
+        return self.text[max(0, idx - radius) : idx + len(needle) + radius]
+
+
+@dataclass
+class SubjectSectionMarker:
+    start: int
+    subject: str
+    header: str
+
+
+def split_combined_subject_document(document: Document) -> list[Document]:
+    markers = find_subject_section_markers(document.text)
+    if len(markers) < 2:
+        return [document]
+
+    documents: list[Document] = []
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start if index + 1 < len(markers) else len(document.text)
+        chunk = document.text[marker.start:end].strip()
+        if len(chunk) < 500:
+            continue
+        documents.append(
+            Document(
+                document.path,
+                chunk,
+                None,
+                grade=infer_grade(document.path, chunk) or document.grade,
+                subject=marker.subject,
+                table_rows=table_rows_for_text(document.table_rows, chunk),
+            )
+        )
+    return documents or [document]
+
+
+def find_subject_section_markers(text: str) -> list[SubjectSectionMarker]:
+    candidates: list[SubjectSectionMarker] = []
+    aliases = subject_aliases()
+    for alias, subject in aliases:
+        pattern = re.compile(
+            rf"(?P<header>[^\n]{{0,90}}{re.escape(alias)}[^\n]{{0,90}}(?:교수\s*[·ㆍ∙]?\s*학습|교수학습|평가\s*세부\s*계획|평가운영계획|평가\s*운영\s*계획)[^\n]{{0,90}})"
+        )
+        for match in pattern.finditer(text):
+            header = clean_cell(match.group("header"))
+            if "예시" in header or "유의사항" in header:
+                continue
+            candidates.append(SubjectSectionMarker(match.start("header"), subject, header))
+
+    candidates.sort(key=lambda item: item.start)
+    markers: list[SubjectSectionMarker] = []
+    for candidate in candidates:
+        if markers:
+            previous = markers[-1]
+            if candidate.subject == previous.subject:
+                continue
+            if candidate.start - previous.start < 800:
+                continue
+        markers.append(candidate)
+    return markers
+
+
+def subject_aliases() -> list[tuple[str, str]]:
+    aliases: list[tuple[str, str]] = [
+        ("기술·가정과", "기술가정"),
+        ("기술ㆍ가정과", "기술가정"),
+        ("기술 가정과", "기술가정"),
+        ("기술가정과", "기술가정"),
+        ("기술과", "기술가정"),
+    ]
+    for subject in SUBJECTS:
+        if subject in {"기술가정", "기술과"}:
+            continue
+        aliases.append((f"{subject}과", subject))
+    return sorted(aliases, key=lambda item: len(item[0]), reverse=True)
+
+
+class RuleEngine:
+    def __init__(self, document: Document) -> None:
+        self.doc = document
+        self.policy = grade_policy_for(document)
+        self.findings: list[ReviewFinding] = []
+
+    def run(self) -> list[ReviewFinding]:
+        self._check_grade_curriculum_policy()
+        self._check_terms()
+        self._check_ratios()
+        self._check_regular_exam_duplicate_codes()
+        self._check_performance_timing_codes()
+        self._check_subject_achievement_level()
+        self._check_performance_criteria_mismatch()
+        self._check_performance_detail_scores()
+        self._check_basic_scores()
+        self._check_rubric_intervals()
+        return self.findings
+
+    def add(self, severity: str, topic: str, anchor: str, lines: list[str], context: str = "") -> None:
+        memo = "◆ " + topic
+        for line in lines:
+            memo += "\n- " + line
+        self.findings.append(
+            ReviewFinding(
+                file_path=self.doc.path,
+                grade=self.doc.grade,
+                subject=self.doc.subject,
+                severity=severity,
+                topic=topic,
+                anchor_text=anchor,
+                memo_text=memo,
+                context=context or self.doc.around(anchor),
+            )
+        )
+
+    def _check_terms(self) -> None:
+        if "지필평가" in self.doc.text:
+            self.add("중", "용어 수정", "지필평가", ["지필평가 → 정기시험으로 수정"])
+        if "서술형" in self.doc.text:
+            self.add("중", "용어 수정", "서술형", ["서술형 → 논술형으로 수정"])
+
+    def _check_ratios(self) -> None:
+        text = self.doc.text
+        ratio_section = section_after(text, "4. 평가의 종류", "5.")
+        ratio_source = ratio_section or text
+        if self.policy.is_free_semester and has_regular_exam_ratio(ratio_source):
+            self.add(
+                "상",
+                "1학년 자유학기 정기시험 확인",
+                "정기시험",
+                ["자유학기 평가계획에 정기시험 반영 항목이 있는지 확인", "자유학기 운영 기준에 맞게 정기시험/반영비율 표기 조정"],
+                context=ratio_source[:1400],
+            )
+
+        mixed_exam_and_performance = "정기시험" in ratio_source and "수행평가" in ratio_source
+        for point, percent in POINT_PERCENT_RE.findall(ratio_source):
+            p = float(percent)
+            # In mixed tables, large 80~94 point rows are regular-exam selected-response
+            # cells, not performance areas. The 30% cap is for each performance area.
+            if p > 30 and not (mixed_exam_and_performance and float(point) > 50):
+                self.add(
+                    "상",
+                    "수행평가 한 영역 30% 초과",
+                    f"{point}점 ({percent}%)",
+                    ["한 수행평가 영역 반영비율이 30% 초과", "세부영역 분리 또는 반영비율 조정"],
+                )
+
+        if ratio_section:
+            percentages = [float(x) for x in PERCENT_RE.findall(ratio_section)]
+            if "합계" in ratio_section and percentages:
+                # Look for common final total error without overfitting every sub-percent.
+                if "100%" not in ratio_section:
+                    self.add("상", "반영비율 합계 확인", "합계", ["정기시험+수행평가 합계 100% 여부 확인"])
+
+    def _check_basic_scores(self) -> None:
+        section = section_after(self.doc.text, "6. 수행평가", "7.")
+        if not section:
+            return
+        ratio_scores = performance_area_scores_from_ratio(assessment_ratio_table_rows(self.doc))
+        if self.doc.table_rows:
+            score_rows = extract_basic_score_rows_from_tables(self.doc.table_rows, ratio_scores)
+        else:
+            score_rows = extract_basic_score_rows(section)
+        for full_score, basic_score, context, anchor in score_rows:
+            if full_score <= 0:
+                continue
+            percent = basic_score / full_score * 100
+            if percent < 20 or percent > 40:
+                self.add(
+                    "상",
+                    "기본점수 범위 오류",
+                    anchor,
+                    [
+                        f"기본점수 {basic_score}점은 만점 {full_score}점 대비 {percent:.1f}%",
+                        "수행평가 기본점수는 만점의 20%~40% 범위로 조정",
+                    ],
+                    context=context,
+                )
+
+    def _check_performance_detail_scores(self) -> None:
+        ratio_scores = performance_area_scores_from_ratio(assessment_ratio_table_rows(self.doc))
+        if not ratio_scores or not self.doc.table_rows:
+            return
+        detail_blocks = performance_detail_blocks_from_tables(self.doc.table_rows)
+        for block in detail_blocks:
+            expected = match_ratio_score(block["name"], ratio_scores)
+            if expected is None:
+                continue
+            detail_score = block["score"]
+            if detail_score != expected:
+                self.add(
+                    "상",
+                    "수행평가 영역 만점 불일치",
+                    f"{detail_score}점",
+                    [
+                        f"4번 평가 종류 표의 영역 만점은 {expected}점이나, 6번 수행평가 세부기준은 {detail_score}점으로 표기",
+                        "4번 영역 만점과 6번 세부기준 만점을 일치시켜 수정",
+                    ],
+                    context=table_rows_text(block["rows"][:10]),
+                )
+
+    def _check_regular_exam_duplicate_codes(self) -> None:
+        if self.policy.skip_regular_exam_checks:
+            return
+        section = section_after(self.doc.text, "4. 평가의 종류", "5.")
+        rows = assessment_ratio_table_rows(self.doc)
+        if not section and not rows:
+            return
+        source_text = table_rows_text(rows) if rows else section
+        if "정기시험" not in source_text or "1차" not in source_text or "2차" not in source_text:
+            return
+        code_groups = table_row_code_groups(rows, "성취기준") if rows else row_code_groups(section, "성취기준")
+        if len(code_groups) < 2:
+            return
+        first, second = code_groups[0], code_groups[1]
+        if first and first == second:
+            self.add(
+                "상",
+                "1·2차 정기시험 성취기준 동일",
+                "성취기준",
+                [
+                    "1차와 2차 정기시험 성취기준이 동일함",
+                    "1차 범위와 2차 범위 성취기준을 분리하여 작성",
+                ],
+                context=source_text[:1800],
+            )
+
+    def _check_performance_timing_codes(self) -> None:
+        section = section_after(self.doc.text, "4. 평가의 종류", "5.")
+        rows = assessment_ratio_table_rows(self.doc)
+        if not section and not rows:
+            return
+        source_text = table_rows_text(rows) if rows else section
+        time_cells = table_row_text_cells(rows, "평가 시기") if rows else row_text_cells(section, "평가 시기")
+        code_groups = table_row_code_groups(rows, "성취기준") if rows else row_code_groups(section, "성취기준")
+        if not time_cells or not code_groups:
+            return
+
+        mixed = "정기시험" in source_text and "수행평가" in source_text
+        skip = 0
+        if mixed:
+            if "1차" in source_text and "2차" in source_text and len(time_cells) >= 4 and len(code_groups) >= 4:
+                skip = 2
+            elif len(time_cells) >= 3 and len(code_groups) >= 3:
+                skip = 1
+        for time_text, codes in zip(time_cells[skip:], code_groups[skip:]):
+            if not codes or "수시" in time_text:
+                continue
+            planned_codes = learned_codes_before_or_by_period(self.doc.text, time_text, self.doc.table_rows)
+            if not planned_codes:
+                continue
+            missing = sorted(codes - planned_codes)
+            if missing:
+                self.add(
+                    "상",
+                    "평가시기-수행 성취기준 불일치",
+                    time_text,
+                    [
+                        f"평가시기 {time_text} 월별 운영계획에 없는 성취기준: {', '.join(missing)}",
+                        "평가시기 또는 수행평가 성취기준 수정",
+                    ],
+                    context=source_text[:1800],
+                )
+
+    def _check_subject_achievement_level(self) -> None:
+        if not self.doc.subject:
+            return
+        text = self.doc.text
+        arts = {"체육", "음악", "미술"}
+        if self.doc.subject in arts:
+            if re.search(r"\bD\b|\bE\b", text):
+                self.add("중", "성취도 체계 확인", "성취도", ["체육·예술 교과는 A~C 체계 적용 여부 확인"])
+        elif self.doc.grade == 1:
+            # 1학년 2022 개정 양식에서는 수행평가 성취수준 A~E 표기가 있을 수 있으므로
+            # A~E 자체를 오류로 보지 않는다. 형식 포함 여부는 학년 정책 점검에서만 확인한다.
+            return
+        elif self.doc.grade in {1, 2, 3}:
+            if "A" in text and "E" not in text and "성취도" in text:
+                self.add("하", "성취도 체계 확인", "성취도", ["일반교과 A~E 성취도 체계 누락 여부 확인"])
+
+    def _check_grade_curriculum_policy(self) -> None:
+        text = self.doc.text
+        if self.doc.grade is None:
+            self.add(
+                "하",
+                "학년 확인 필요",
+                self.doc.path.name,
+                ["파일명 또는 본문에서 학년을 명확히 추정하지 못함", "학년별 교육과정 기준 적용을 위해 학년 표기 확인"],
+                context=text[:900],
+            )
+            return
+
+        if self.doc.grade in {1, 2}:
+            if not contains_2022_curriculum(text):
+                self.add(
+                    "중",
+                    "1·2학년 2022 개정 교육과정 확인",
+                    "성취수준",
+                    ["1·2학년은 2022 개정 교육과정 기준 적용", "성취기준별 성취수준 및 학기 단위 성취수준 포함 여부 확인"],
+                    context=curriculum_context(text),
+                )
+            missing = missing_2022_achievement_level_sections(text)
+            if missing:
+                self.add(
+                    "중",
+                    "2022 개정 성취수준 항목 확인",
+                    missing[0],
+                    [f"확인 필요 항목: {', '.join(missing)}", "1·2학년 양식에는 성취기준별 성취수준과 학기 단위 성취수준 포함 여부 확인"],
+                    context=curriculum_context(text),
+                )
+        elif self.doc.grade == 3:
+            if not contains_2015_curriculum(text):
+                self.add(
+                    "하",
+                    "3학년 2015 개정 교육과정 확인",
+                    "평가기준",
+                    ["3학년은 2015 개정 교육과정 기준 적용", "'평가기준' 용어 사용 자체는 오류가 아니나 2015 개정 기준 여부 확인"],
+                    context=curriculum_context(text),
+                )
+
+    def _check_performance_criteria_mismatch(self) -> None:
+        text = self.doc.text
+        section = section_after(text, "6. 수행평가", "7.")
+        if not section:
+            return
+        blocks = split_performance_blocks(section)
+        for block in blocks:
+            edu_part = section_between(block, "교육과정 성취기준", "평가 기준") or section_between(block, "교육과정 성취기준", "평가기준")
+            criteria_part = section_between(block, "평가 기준", "평가 요소") or section_between(block, "평가기준", "평가요소")
+            if not edu_part or not criteria_part:
+                continue
+            edu_codes = set(CODE_RE.findall(edu_part))
+            criteria_codes = set(CODE_RE.findall(criteria_part))
+            extra = sorted(criteria_codes - edu_codes)
+            if extra:
+                anchor = extra[0]
+                self.add(
+                    "상",
+                    "수행평가 성취기준-평가기준 불일치",
+                    anchor,
+                    [
+                        "교육과정 성취기준과 평가기준 코드 불일치",
+                        f"평가기준에만 있는 코드: {', '.join(extra)}",
+                        "해당 수행평가 성취기준과 코드 일치 필요",
+                    ],
+                    context=block[:1200],
+                )
+
+    def _check_rubric_intervals(self) -> None:
+        if self.doc.table_rows:
+            for item in extract_table_rubric_ladders(self.doc.table_rows):
+                scores = item["scores"]
+                if len(scores) < 4:
+                    continue
+                interval_scores = comparable_interval_scores(scores)
+                diffs = [interval_scores[i] - interval_scores[i + 1] for i in range(len(interval_scores) - 1)]
+                if len(interval_scores) >= 4 and all(diff > 0 for diff in diffs) and len(set(diffs)) > 1:
+                    score_text = "-".join(str(s) for s in interval_scores)
+                    anchor = str(item.get("score_anchor") or item.get("top_anchor") or scores[min(2, len(scores) - 1)])
+                    self.add(
+                        "중",
+                        "배점 급간 불균등",
+                        anchor,
+                        [
+                            f"{score_text}로 감소 폭 불규칙",
+                            "배점 급간 불균등은 수정 필수: 균등 급간으로 조정",
+                        ],
+                        context=item["context"],
+                    )
+
+                max_score = max(scores)
+                min_score = min(scores)
+                if max_score > 0:
+                    percent = min_score / max_score * 100
+                    if percent < 20 or percent > 40:
+                        self.add(
+                            "상",
+                            "평가요소 최하점 범위 오류",
+                            str(item.get("min_anchor") or min_score),
+                            [
+                                f"평가요소 최하점 {min_score}점은 요소 만점 {max_score}점 대비 {percent:.1f}%",
+                                "평가요소별 최하점도 요소 만점의 20%~40% 범위로 조정",
+                            ],
+                            context=item["context"],
+                        )
+
+            return
+
+        text = self.doc.text
+        section = section_after(text, "6. 수행평가", "7.")
+        if not section:
+            return
+        blocks = split_performance_blocks(section)
+        for block in blocks:
+            rows = extract_rubric_rows(block)
+            for anchor, scores, is_explicit_rubric in rows:
+                if not is_explicit_rubric or len(scores) < 4:
+                    continue
+                diffs = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+                if len(set(diffs)) > 1:
+                    score_text = "-".join(str(s) for s in scores)
+                    self.add(
+                        "중",
+                        "배점 급간 불균등",
+                        anchor,
+                        [
+                            f"{score_text}로 감소 폭 불규칙",
+                            "배점 급간 불균등은 수정 필수: 균등 급간으로 조정",
+                        ],
+                        context=block[:1600],
+                    )
+
+
+class HwpxMemoWriter:
+    @classmethod
+    def copy_with_memos(cls, src: Path, dst: Path, findings: list[ReviewFinding]) -> dict[str, object]:
+        with zipfile.ZipFile(src, "r") as zin:
+            entries = [(info, zin.read(info.filename)) for info in zin.infolist()]
+
+        inserted = []
+        inserted_indexes: set[int] = set()
+        with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info, data in entries:
+                if info.filename == "Contents/header.xml":
+                    data = cls.ensure_memo_properties(data.decode("utf-8")).encode("utf-8")
+                elif info.filename.startswith("Contents/section") and info.filename.endswith(".xml"):
+                    section = cls.strip_existing_memos(data.decode("utf-8"))
+                    for offset, finding in enumerate(findings, start=1):
+                        if offset in inserted_indexes:
+                            continue
+                        section, ok = cls.insert_memo_near_anchor(section, finding, offset)
+                        if ok:
+                            inserted.append(finding.anchor_text)
+                            inserted_indexes.add(offset)
+                    data = section.encode("utf-8")
+                zout.writestr(info, data)
+        missing = [finding.anchor_text for offset, finding in enumerate(findings, start=1) if offset not in inserted_indexes]
+        return {"source": str(src), "output": str(dst), "inserted": inserted, "missing": missing}
+
+    @staticmethod
+    def ensure_memo_properties(header: str) -> str:
+        if "<hh:memoProperties" in header:
+            return header
+        memo_pr = (
+            '<hh:memoProperties itemCnt="1">'
+            '<hh:memoPr id="1" width="15591" lineWidth="1" lineType="SOLID" '
+            'lineColor="#6AA84F" fillColor="#D9EAD3" activeColor="#B6D7A8" memoType="NOMAL"/>'
+            "</hh:memoProperties>"
+        )
+        return header.replace("</hh:refList>", memo_pr + "</hh:refList>")
+
+    @staticmethod
+    def strip_existing_memos(section: str) -> str:
+        memo_ids = re.findall(
+            r'<hp:ctrl><hp:fieldBegin\b(?=[^>]*\btype="MEMO")(?=[^>]*\bid="([^"]+)")[\s\S]*?</hp:fieldBegin></hp:ctrl>',
+            section,
+        )
+        section = re.sub(
+            r'<hp:ctrl><hp:fieldBegin\b(?=[^>]*\btype="MEMO")[\s\S]*?</hp:fieldBegin></hp:ctrl>',
+            "",
+            section,
+        )
+        for memo_id in memo_ids:
+            section = re.sub(
+                rf'<hp:ctrl><hp:fieldEnd\b(?=[^>]*\bbeginIDRef="{re.escape(memo_id)}")[^>]*/></hp:ctrl><hp:t/>',
+                "",
+                section,
+            )
+            section = re.sub(
+                rf'<hp:ctrl><hp:fieldEnd\b(?=[^>]*\bbeginIDRef="{re.escape(memo_id)}")[^>]*/></hp:ctrl>',
+                "",
+                section,
+            )
+        return section
+
+    @classmethod
+    def insert_memo_near_anchor(cls, section: str, finding: ReviewFinding, number: int) -> tuple[str, bool]:
+        candidates = anchor_candidates(finding)
+        for candidate in candidates:
+            section, ok = cls.insert_exact_text(section, candidate, finding.memo_text, number, finding.context)
+            if ok:
+                return section, True
+        return section, False
+
+    @classmethod
+    def insert_exact_text(cls, section: str, anchor: str, memo_text: str, number: int, context: str = "") -> tuple[str, bool]:
+        escaped = html.escape(anchor, quote=False)
+        matches: list[tuple[int, int, str]] = []
+        for node in (f"<hp:t>{escaped}</hp:t>", f"<hp:t>{escaped} </hp:t>"):
+            start = 0
+            while True:
+                idx = section.find(node, start)
+                if idx < 0:
+                    break
+                matches.append((idx, idx + len(node), node))
+                start = idx + len(node)
+
+        pattern = re.compile(rf"(<hp:t[^>]*>)([^<]*{re.escape(escaped)}[^<]*)(</hp:t>)")
+        for match in pattern.finditer(section):
+            matches.append((match.start(), match.end(), match.group(0)))
+
+        if matches:
+            start, end, node = max(
+                matches,
+                key=lambda item: context_match_score(section, item[0], item[1], context),
+            )
+            replacement = cls.memo_begin(number, memo_text) + node + cls.memo_end(number)
+            return section[:start] + replacement + section[end:], True
+        return section, False
+
+    @staticmethod
+    def memo_begin(number: int, memo_text: str) -> str:
+        msg = html.escape(memo_text, quote=False).replace("\n", "<hp:lineBreak/>")
+        begin_id = 1430000000 + number
+        serial = 73000000 + number
+        return (
+            f'<hp:ctrl><hp:fieldBegin id="{begin_id}" type="MEMO" name="" editable="1" '
+            f'dirty="1" zorder="{number}" fieldid="623209829" metaTag="">'
+            f'<hp:parameters cnt="7" name="">'
+            f'<hp:integerParam name="Prop">0</hp:integerParam>'
+            f'<hp:stringParam name="Command">MEMO/65535/{number}/1822614864/{serial}/AI교사/\\;;</hp:stringParam>'
+            f'<hp:stringParam name="ID">memo{number}</hp:stringParam>'
+            f'<hp:integerParam name="Number">{number}</hp:integerParam>'
+            f'<hp:stringParam name="Author">AI교사</hp:stringParam>'
+            f'<hp:stringParam name="MemoShapeIDRef">65535</hp:stringParam>'
+            f'<hp:stringParam name="CreateDateTime">2026-06-30T09:00:00Z</hp:stringParam>'
+            f"</hp:parameters>"
+            f'<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" '
+            f'linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">'
+            f'<hp:p id="0" paraPrIDRef="11" styleIDRef="17" pageBreak="0" columnBreak="0" merged="0">'
+            f'<hp:run charPrIDRef="4"><hp:t>{msg}</hp:t></hp:run>'
+            f"</hp:p></hp:subList></hp:fieldBegin></hp:ctrl>"
+        )
+
+    @staticmethod
+    def memo_end(number: int) -> str:
+        return f'<hp:ctrl><hp:fieldEnd beginIDRef="{1430000000 + number}" fieldid="623209829"/></hp:ctrl><hp:t/>'
+
+
+def normalize_text(text: str) -> str:
+    return text.replace("\u00a0", " ").replace("\r\n", "\n")
+
+
+def read_text_file(path: Path) -> str:
+    for encoding in ("utf-8", "utf-8-sig", "cp949"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def read_hwpx_section(path: Path) -> str:
+    with zipfile.ZipFile(path) as zf:
+        section_names = [
+            name
+            for name in zf.namelist()
+            if re.fullmatch(r"Contents/section\d+\.xml", name)
+        ]
+        if not section_names:
+            return ""
+        section_names.sort(key=lambda name: int(re.search(r"section(\d+)\.xml", name).group(1)))
+        return "\n".join(
+            zf.read(name).decode("utf-8", errors="ignore")
+            for name in section_names
+        )
+
+
+def extract_visible_text(section_xml: str) -> str:
+    text = re.sub(r"<hp:lineBreak\s*/>", "\n", section_xml)
+    texts = re.findall(r"<hp:t(?:\s[^>]*)?>(.*?)</hp:t>", text, re.S)
+    return normalize_text("\n".join(html.unescape(t) for t in texts))
+
+
+def context_match_score(section: str, start: int, end: int, context: str) -> int:
+    if not context:
+        return 0
+    window = section[max(0, start - 20000) : min(len(section), end + 20000)]
+    visible = extract_visible_text(window)
+    score = 0
+    for token in context_tokens(context):
+        if token in visible:
+            score += 1
+    return score
+
+
+def context_tokens(text: str) -> list[str]:
+    cleaned = clean_cell(text)
+    tokens: list[str] = []
+    tokens.extend(CODE_RE.findall(cleaned))
+    tokens.extend(re.findall(r"\d+월\s*\d+(?:~\d+)?주", cleaned))
+    tokens.extend(re.findall(r"\d+(?:\.\d+)?점\s*\(\s*\d+(?:\.\d+)?%\s*\)", cleaned))
+    tokens.extend(re.findall(r"[0-9A-Za-z가-힣·․~()]{4,}", cleaned))
+    seen = set()
+    result = []
+    for token in tokens:
+        if token and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result[:80]
+
+
+def extract_hwpx_table_rows(section_xml: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    row_span_cells: dict[int, tuple[int, str]] = {}
+    for row_xml in re.findall(r"<hp:tr\b[\s\S]*?</hp:tr>", section_xml):
+        cells: list[str] = []
+        current_col = 0
+        touched_spans: set[int] = set()
+        for cell_xml in re.findall(r"<hp:tc\b[\s\S]*?</hp:tc>", row_xml):
+            col_addr_match = re.search(r"<hp:cellAddr\b[^>]*\bcolAddr=\"(\d+)\"", cell_xml)
+            span_match = re.search(r"<hp:cellSpan\b[^>]*\bcolSpan=\"(\d+)\"\s+rowSpan=\"(\d+)\"", cell_xml)
+            target_col = int(col_addr_match.group(1)) if col_addr_match else current_col
+            while current_col < target_col:
+                if current_col in row_span_cells:
+                    _, span_text = row_span_cells[current_col]
+                    cells.append(span_text)
+                    touched_spans.add(current_col)
+                else:
+                    cells.append("")
+                current_col += 1
+
+            cell_text = extract_visible_text(cell_xml)
+            cell_text = re.sub(r"\s+", " ", cell_text).strip()
+            col_span = int(span_match.group(1)) if span_match else 1
+            row_span = int(span_match.group(2)) if span_match else 1
+            cells.append(cell_text)
+            if row_span > 1:
+                for offset in range(col_span):
+                    row_span_cells[target_col + offset] = (row_span - 1, cell_text if offset == 0 else "")
+            current_col = target_col + col_span
+
+        for col in sorted(row_span_cells):
+            if col >= current_col:
+                _, span_text = row_span_cells[col]
+                cells.append(span_text)
+                touched_spans.add(col)
+
+        for col in list(touched_spans):
+            remaining, span_text = row_span_cells[col]
+            if remaining <= 1:
+                row_span_cells.pop(col, None)
+            else:
+                row_span_cells[col] = (remaining - 1, span_text)
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def infer_grade(path: Path, text: str) -> int | None:
+    sample = f"{path.name}\n{text[:2000]}"
+    match = re.search(r"([123])\s*학년", sample)
+    return int(match.group(1)) if match else None
+
+
+def infer_subject(path: Path, text: str) -> str | None:
+    filename = path.name
+    normalized_filename = re.sub(r"\s+", "", filename)
+
+    filename_patterns = [
+        ("기술가정", ["기술가정과", "기술가정"]),
+        ("기술가정", ["기술과"]),
+        ("국어", ["국어과"]),
+        ("도덕", ["도덕과"]),
+        ("사회", ["사회과"]),
+        ("역사", ["역사과"]),
+        ("수학", ["수학과"]),
+        ("과학", ["과학과"]),
+        ("체육", ["체육과"]),
+        ("음악", ["음악과"]),
+        ("미술", ["미술과"]),
+        ("영어", ["영어과"]),
+        ("한문", ["한문과"]),
+        ("정보", ["정보과"]),
+    ]
+    for subject, patterns in filename_patterns:
+        for pattern in patterns:
+            if pattern in normalized_filename:
+                return subject
+
+    for subject in SUBJECTS:
+        if subject in filename and not (subject == "수학" and "교수학습" in filename):
+            if subject == "기술과":
+                return "기술가정"
+            return subject
+    sample = text[:2000]
+    for subject in SUBJECTS:
+        if subject in sample:
+            if subject == "기술과":
+                return "기술가정"
+            return subject
+    return None
+
+
+def contains_2022_curriculum(text: str) -> bool:
+    return bool(re.search(r"2022\s*개정|22\s*개정|2022\s*년?\s*교육과정|22\s*년?\s*교육과정", text))
+
+
+def contains_2015_curriculum(text: str) -> bool:
+    return bool(re.search(r"2015\s*개정|15\s*개정|2015\s*년?\s*교육과정|15\s*년?\s*교육과정|평가기준", text))
+
+
+def missing_2022_achievement_level_sections(text: str) -> list[str]:
+    compact = re.sub(r"\s+", "", text)
+    checks = [
+        ("성취기준별 성취수준", ("성취기준별성취수준", "성취기준에따른성취수준")),
+        ("학기 단위 성취수준", ("학기단위성취수준", "학기말성취수준")),
+    ]
+    missing = []
+    for label, patterns in checks:
+        if not any(pattern in compact for pattern in patterns):
+            missing.append(label)
+    return missing
+
+
+def curriculum_context(text: str) -> str:
+    keywords = ["2022", "22개정", "2015", "15개정", "성취수준", "평가기준", "교육과정"]
+    positions = [text.find(keyword) for keyword in keywords if text.find(keyword) >= 0]
+    if not positions:
+        return text[:1200]
+    start = max(0, min(positions) - 500)
+    return text[start : start + 1600]
+
+
+def has_regular_exam_ratio(text: str) -> bool:
+    if "정기시험" not in text:
+        return False
+    if not ("평가 종류" in text or "평가의 종류" in text or "반영비율" in text or "시기/영역" in text):
+        return False
+    if "1차" in text or "2차" in text:
+        return True
+    return bool(re.search(r"정기시험[\s\S]{0,160}\d+(?:\.\d+)?\s*%", text))
+
+
+def section_after(text: str, start_marker: str, end_marker: str) -> str:
+    start = text.find(start_marker)
+    if start < 0:
+        return ""
+    end = text.find(end_marker, start + len(start_marker))
+    if end < 0:
+        return text[start:]
+    return text[start:end]
+
+
+def section_between(text: str, start_marker: str, end_marker: str) -> str:
+    start = text.find(start_marker)
+    if start < 0:
+        return ""
+    end = text.find(end_marker, start + len(start_marker))
+    if end < 0:
+        return ""
+    return text[start:end]
+
+
+ROW_LABELS = [
+    "평가 종류",
+    "반영비율",
+    "시기/영역",
+    "영역 만점",
+    "논술형 평가",
+    "성취기준",
+    "평가 요소",
+    "평가 시기",
+]
+
+
+def row_segment(section: str, label: str) -> str:
+    start = section.find(label)
+    if start < 0:
+        return ""
+    end_candidates = []
+    for other in ROW_LABELS:
+        if other == label:
+            continue
+        idx = section.find(other, start + len(label))
+        if idx >= 0:
+            end_candidates.append(idx)
+    end = min(end_candidates) if end_candidates else len(section)
+    return section[start:end]
+
+
+def row_text_cells(section: str, label: str) -> list[str]:
+    segment = row_segment(section, label)
+    if not segment:
+        return []
+    parts = [clean_cell(part) for part in segment.split("|")]
+    cells = []
+    for part in parts:
+        if not part or label in part or set(part) <= {"-", ":"}:
+            continue
+        if part == "**":
+            continue
+        cells.append(part)
+    return cells
+
+
+def row_code_groups(section: str, label: str) -> list[set[str]]:
+    cells = row_text_cells(section, label)
+    groups = []
+    for cell in cells:
+        codes = set(CODE_RE.findall(cell))
+        if codes:
+            groups.append(codes)
+    return groups
+
+
+def assessment_ratio_table_rows(doc: Document) -> list[list[str]]:
+    rows = doc.table_rows
+    for index, row in enumerate(rows):
+        joined = " ".join(row)
+        if "평가" in joined and "종류" in joined:
+            end = min(len(rows), index + 14)
+            for j in range(index + 1, min(len(rows), index + 25)):
+                if "성취율" in " ".join(rows[j]):
+                    end = j
+                    break
+            chunk = rows[index:end]
+            if any("성취기준" in " ".join(r) for r in chunk) and any("평가 시기" in " ".join(r) for r in chunk):
+                return chunk
+    return []
+
+
+def table_rows_text(rows: list[list[str]]) -> str:
+    return "\n".join(" | ".join(row) for row in rows)
+
+
+def table_rows_for_text(rows: list[list[str]], text: str) -> list[list[str]]:
+    if not rows:
+        return []
+    compact_text = re.sub(r"\s+", "", text)
+    matched: list[list[str]] = []
+    for row in rows:
+        cells = [clean_cell(cell) for cell in row if clean_cell(cell)]
+        distinctive = [
+            re.sub(r"\s+", "", cell)
+            for cell in cells
+            if len(re.sub(r"\s+", "", cell)) >= 4
+        ]
+        if not distinctive:
+            continue
+        hits = sum(1 for cell in distinctive[:4] if cell in compact_text)
+        if hits >= min(2, len(distinctive)):
+            matched.append(row)
+    return matched
+
+
+def table_row_text_cells(rows: list[list[str]], label: str) -> list[str]:
+    compact_label = re.sub(r"\s+", "", label)
+    for row in rows:
+        compact_cells = [re.sub(r"\s+", "", cell) for cell in row]
+        if any(compact_label in cell for cell in compact_cells):
+            cells = []
+            seen_label = False
+            for cell in row:
+                cleaned = clean_cell(cell)
+                if not cleaned:
+                    continue
+                if not seen_label and compact_label in re.sub(r"\s+", "", cleaned):
+                    seen_label = True
+                    continue
+                if seen_label and cleaned not in {"-", "**"}:
+                    cells.append(cleaned)
+            return cells
+    return []
+
+
+def table_row_code_groups(rows: list[list[str]], label: str) -> list[set[str]]:
+    groups = []
+    for cell in table_row_text_cells(rows, label):
+        codes = set(CODE_RE.findall(cell))
+        if codes:
+            groups.append(codes)
+    return groups
+
+
+def clean_cell(text: str) -> str:
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("*", " ")
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(1, 100):
+        candidate = path.with_name(f"{path.stem}{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem}_latest{path.suffix}")
+
+
+def clear_directory_contents(folder: Path) -> None:
+    for child in folder.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except PermissionError:
+            # The app can still create a fresh numbered copy for locked HWPX files.
+            continue
+
+
+def monthly_codes_for_period(text: str, period: str, table_rows: list[list[str]] | None = None) -> set[str]:
+    if "수시" in period or "중" in period:
+        return set()
+    week_keys = parse_period_weeks(period)
+    if week_keys and table_rows:
+        week_map = monthly_week_code_map(table_rows)
+        codes: set[str] = set()
+        for key in week_keys:
+            codes.update(week_map.get(key, set()))
+        if codes:
+            return codes
+
+    months = [int(month) for month in re.findall(r"([3-7])\s*월", period)]
+    if not months:
+        return set()
+
+    plan_text = text
+    cut = plan_text.find("1. 평가의 목적")
+    if cut >= 0:
+        plan_text = plan_text[:cut]
+
+    codes: set[str] = set()
+    for month in months:
+        month_block = monthly_block(plan_text, month)
+        codes.update(CODE_RE.findall(month_block))
+    return codes
+
+
+def learned_codes_before_or_by_period(text: str, period: str, table_rows: list[list[str]] | None = None) -> set[str]:
+    if "수시" in period or "중" in period:
+        return set()
+    week_keys = parse_period_weeks(period)
+    if week_keys and table_rows:
+        week_map = monthly_week_code_map(table_rows)
+        if week_map:
+            cutoff = max(week_keys)
+            codes: set[str] = set()
+            for key, key_codes in week_map.items():
+                if key <= cutoff:
+                    codes.update(key_codes)
+            return codes
+    return monthly_codes_for_period(text, period, table_rows)
+
+
+def monthly_block(plan_text: str, month: int) -> str:
+    pattern = re.compile(rf"(?:^|\s|\*){month}\s*월(?:\s|\*|$)")
+    match = pattern.search(plan_text)
+    if not match:
+        return ""
+    next_matches = []
+    for next_month in range(month + 1, 8):
+        next_match = re.search(rf"(?:^|\s|\*){next_month}\s*월(?:\s|\*|$)", plan_text[match.end():])
+        if next_match:
+            next_matches.append(match.end() + next_match.start())
+    end = min(next_matches) if next_matches else len(plan_text)
+    return plan_text[match.start():end]
+
+
+def parse_period_weeks(period: str) -> list[tuple[int, int]]:
+    compact = re.sub(r"\s+", "", period)
+    if not compact or "수시" in compact or "중" in compact:
+        return []
+
+    cross_month = re.search(r"([3-7])월([1-5])주~([3-7])월([1-5])주", compact)
+    if cross_month:
+        start_month, start_week, end_month, end_week = map(int, cross_month.groups())
+        return expand_week_range(start_month, start_week, end_month, end_week)
+
+    same_month = re.search(r"([3-7])월([1-5])(?:~([1-5]))?주", compact)
+    if same_month:
+        month = int(same_month.group(1))
+        start = int(same_month.group(2))
+        end = int(same_month.group(3) or start)
+        if start <= end:
+            return [(month, week) for week in range(start, end + 1)]
+        return [(month, start)]
+
+    return []
+
+
+def expand_week_range(start_month: int, start_week: int, end_month: int, end_week: int) -> list[tuple[int, int]]:
+    keys: list[tuple[int, int]] = []
+    for month in range(start_month, end_month + 1):
+        first_week = start_week if month == start_month else 1
+        last_week = end_week if month == end_month else 5
+        for week in range(first_week, last_week + 1):
+            keys.append((month, week))
+    return keys
+
+
+def monthly_week_code_map(rows: list[list[str]]) -> dict[tuple[int, int], set[str]]:
+    result: dict[tuple[int, int], set[str]] = {}
+    current_month: int | None = None
+    for row in rows:
+        joined = " ".join(row)
+        if "평가의 목적" in joined:
+            break
+        if not CODE_RE.search(joined):
+            continue
+
+        numbers: list[int] = []
+        explicit_weeks: list[int] = []
+        for cell_index, cell in enumerate(row[:4]):
+            cleaned = clean_cell(cell)
+            if re.fullmatch(r"[0-9]+", cleaned):
+                if cell_index == 0 and current_month is not None and len(row) < 7 and 1 <= int(cleaned) <= 5:
+                    explicit_weeks.append(int(cleaned))
+                    continue
+                numbers.append(int(cleaned))
+            elif re.fullmatch(r"[3-7]\s*월", cleaned):
+                numbers.append(int(cleaned[0]))
+            elif re.fullmatch(r"[1-5]\s*주", cleaned):
+                numbers.append(int(cleaned[0]))
+            else:
+                week_range = re.fullmatch(r"([1-5])\s*~\s*([1-5])", cleaned)
+                if week_range:
+                    start, end = map(int, week_range.groups())
+                    if start <= end:
+                        explicit_weeks.extend(range(start, end + 1))
+                week_single = re.fullmatch(r"([1-5])\s*주?", cleaned)
+                if week_single:
+                    explicit_weeks.append(int(week_single.group(1)))
+
+        month: int | None = None
+        week: int | None = None
+        for number in numbers:
+            if month is None and 3 <= number <= 7:
+                month = number
+                current_month = number
+            elif week is None and 1 <= number <= 5:
+                week = number
+
+        if month is None:
+            month = current_month
+            if explicit_weeks:
+                week = explicit_weeks[0]
+            else:
+                for number in numbers:
+                    if 1 <= number <= 5:
+                        week = number
+                        break
+
+        codes = set(CODE_RE.findall(joined))
+        if month and explicit_weeks:
+            for explicit_week in explicit_weeks:
+                result.setdefault((month, explicit_week), set()).update(codes)
+        elif month and week:
+            result.setdefault((month, week), set()).update(codes)
+    return result
+
+
+def split_performance_blocks(section: str) -> list[str]:
+    markers = list(re.finditer(r"(?:^|\n)\s*(?:[가-하]\.|[0-9]+\.)\s*[^\n]{2,60}", section))
+    if not markers:
+        return [section]
+    blocks = []
+    for i, marker in enumerate(markers):
+        start = marker.start()
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(section)
+        block = section[start:end]
+        if "평가" in block or "성취기준" in block:
+            blocks.append(block)
+    return blocks or [section]
+
+
+def extract_rubric_rows(block: str) -> list[tuple[str, list[int], bool]]:
+    # Finds score ladders around phrases such as "채점 기준을 4개 만족한 경우 7".
+    if block.count("평가영역명") > 1:
+        rows: list[tuple[str, list[int], bool]] = []
+        for part in re.split(r"(?=평가영역명)", block):
+            if part and part != block:
+                rows.extend(extract_rubric_rows(part))
+        return rows
+
+    rows: list[tuple[str, list[int], bool]] = []
+    pattern = re.compile(r"(채점\s*기준[^|]{0,80}만족[^|]{0,80})\|\s*(\d{1,2})\s*(?=\|)")
+    matches = list(pattern.finditer(block))
+    if matches:
+        scores = [int(m.group(2)) for m in matches]
+        for run in descending_runs(scores):
+            if len(run) >= 4:
+                rows.append((str(run[min(2, len(run) - 1)]), run, True))
+
+    # Fallback for compact table text: collect descending score runs.
+    numbers = [int(n) for n in re.findall(r"(?<![0-9])([1-9]|10|20|30)(?![0-9])", block)]
+    run: list[int] = []
+    for n in numbers:
+        if not run or n < run[-1]:
+            run.append(n)
+        else:
+            if len(run) >= 4 and max(run) <= 30:
+                rows.append((str(run[min(2, len(run) - 1)]), run, False))
+            run = [n]
+    if len(run) >= 4 and max(run) <= 30:
+        rows.append((str(run[min(2, len(run) - 1)]), run, False))
+    return rows
+
+
+def descending_runs(scores: list[int]) -> list[list[int]]:
+    if not scores:
+        return []
+    runs: list[list[int]] = []
+    run = [scores[0]]
+    for score in scores[1:]:
+        if score < run[-1]:
+            run.append(score)
+        else:
+            runs.append(run)
+            run = [score]
+    runs.append(run)
+    return runs
+
+
+def extract_basic_score_rows(section: str) -> list[tuple[int, int, str, str]]:
+    rows: list[tuple[int, int, str, str]] = []
+    markers = list(re.finditer(r"평가영역명[\s\S]{0,160}?\((\d{1,3})점\)", section))
+    for index, marker in enumerate(markers):
+        full_score = int(marker.group(1))
+        start = marker.start()
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(section)
+        block = section[start:end]
+        basic_index = block.find("기본점수")
+        if basic_index < 0:
+            continue
+        snippet = block[basic_index : basic_index + 350]
+        stop_positions = [
+            pos for pos in (
+                snippet.find("자발적"),
+                snippet.find("미참여자"),
+                snippet.find("장기"),
+                snippet.find("미인정"),
+                snippet.find("학업성적관리규정"),
+            )
+            if pos > 0
+        ]
+        if stop_positions:
+            snippet = snippet[: min(stop_positions)]
+        if "|" in snippet:
+            scores = [int(score) for score in re.findall(r"\|\s*(\d{1,3})\s*(?=\|)", snippet)]
+            if not scores:
+                continue
+            basic_score = scores[0]
+        else:
+            match = re.search(r"기본점수[^\d]{0,80}(?<![0-9])(\d{1,3})(?![0-9])", snippet)
+            if not match:
+                continue
+            basic_score = int(match.group(1))
+        if basic_score > full_score:
+            continue
+        rows.append((full_score, basic_score, block[:1600], "기본점수"))
+    return rows
+
+
+def performance_area_scores_from_ratio(rows: list[list[str]]) -> dict[str, int]:
+    names = table_row_text_cells(rows, "시기/영역")
+    score_cells = table_row_text_cells(rows, "영역 만점")
+    if not names or not score_cells:
+        return {}
+
+    source_text = table_rows_text(rows)
+    skip = 0
+    if "정기시험" in source_text:
+        skip = 2 if "1차" in source_text and "2차" in source_text else 1
+
+    names = [
+        name
+        for name in names[skip:]
+        if name not in {"-", ""} and normalize_area_name(name) not in {"선택형", "논술형", "1차", "2차"}
+    ]
+    score_values: list[int] = []
+    for score_cell in score_cells:
+        match = re.search(r"(\d{1,3})\s*점", score_cell)
+        if match:
+            score_values.append(int(match.group(1)))
+    if score_values and score_values[-1] == 100:
+        score_values = score_values[:-1]
+    score_values = score_values[-len(names) :] if names else []
+
+    result: dict[str, int] = {}
+    for name, score in zip(names, score_values):
+        if score <= 0 or score > 50:
+            continue
+        result[normalize_area_name(name)] = score
+    return result
+
+
+def normalize_area_name(name: str) -> str:
+    name = clean_cell(name)
+    name = re.sub(r"\([^)]*논술형[^)]*\)", "", name)
+    name = re.sub(r"\(\s*\d{1,3}\s*점\s*\)", "", name)
+    name = re.sub(r"[^0-9A-Za-z가-힣]", "", name)
+    return name
+
+
+def match_ratio_score(detail_name: str, ratio_scores: dict[str, int]) -> int | None:
+    normalized = normalize_area_name(detail_name)
+    if normalized in ratio_scores:
+        return ratio_scores[normalized]
+    for name, score in ratio_scores.items():
+        if name and (name in normalized or normalized in name):
+            return score
+    return None
+
+
+def performance_detail_blocks_from_tables(rows: list[list[str]]) -> list[dict[str, object]]:
+    blocks: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    for row in rows:
+        joined = " ".join(row)
+        if row and "평가영역명" in row[0]:
+            match = re.search(r"(.+?)\((\d{1,3})\s*점\)", joined)
+            if match:
+                if current:
+                    blocks.append(current)
+                current = {"name": match.group(1).replace("평가영역명", "").strip(), "score": int(match.group(2)), "rows": [row]}
+                continue
+        if row and "평가 영역명" in row[0]:
+            name = row[1] if len(row) > 1 else ""
+            score: int | None = None
+            for index, cell in enumerate(row):
+                if "영역만점" in cell and index + 1 < len(row):
+                    match = re.search(r"\d{1,3}", row[index + 1])
+                    if match:
+                        score = int(match.group(0))
+                        break
+            if name and score is not None:
+                if current:
+                    blocks.append(current)
+                current = {"name": name, "score": score, "rows": [row]}
+                continue
+        if current:
+            current["rows"].append(row)  # type: ignore[index]
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def extract_basic_score_rows_from_tables(
+    rows: list[list[str]], ratio_scores: dict[str, int] | None = None
+) -> list[tuple[int, int, str, str]]:
+    result: list[tuple[int, int, str, str]] = []
+    ratio_scores = ratio_scores or {}
+    for block in performance_detail_blocks_from_tables(rows):
+        block_rows = block["rows"]  # type: ignore[assignment]
+        detail_score = int(block["score"])
+        full_score = match_ratio_score(str(block["name"]), ratio_scores) or detail_score
+        for row in block_rows:
+            joined = " ".join(row)
+            if not is_overall_basic_score_row(row):
+                continue
+
+            numeric_cells: list[int] = []
+            for cell in row:
+                cleaned = clean_cell(cell)
+                if re.fullmatch(r"\d{1,3}", cleaned):
+                    numeric_cells.append(int(cleaned))
+
+            if not numeric_cells:
+                trailing = re.findall(r"(?<![0-9])(\d{1,3})(?![0-9])", joined)
+                numeric_cells = [int(value) for value in trailing]
+
+            candidates = [score for score in numeric_cells if score <= max(full_score, detail_score)]
+            if not candidates:
+                continue
+
+            basic_score = candidates[-1]
+            context = table_rows_text(block_rows)
+            result.append((full_score, basic_score, context, str(basic_score)))
+
+    return result
+
+
+def is_overall_basic_score_row(row: list[str]) -> bool:
+    if not row:
+        return False
+    first = clean_cell(row[0]).replace(" ", "")
+    if first.startswith("기본점수"):
+        return True
+    if first.startswith("(기본점수)") or first.startswith("기본점수("):
+        return True
+    return False
+
+
+def extract_table_rubric_ladders(rows: list[list[str]]) -> list[dict[str, object]]:
+    ladders: list[dict[str, object]] = []
+    for block in performance_detail_blocks_from_tables(rows):
+        block_rows = block["rows"]  # type: ignore[assignment]
+        current_scores: list[int] = []
+        current_rows: list[list[str]] = []
+
+        def flush() -> None:
+            nonlocal current_scores, current_rows
+            if len(current_scores) >= 4:
+                min_index = current_scores.index(min(current_scores))
+                min_row = current_rows[min_index] if min_index < len(current_rows) else []
+                score_index = min(2, len(current_scores) - 1)
+                score_row = current_rows[score_index] if score_index < len(current_rows) else []
+                top_row = current_rows[0] if current_rows else []
+                ladders.append(
+                    {
+                        "scores": current_scores[:],
+                        "context": table_rows_text(current_rows),
+                        "min_anchor": rubric_row_anchor(min_row),
+                        "score_anchor": rubric_row_anchor(score_row),
+                        "top_anchor": rubric_row_anchor(top_row),
+                    }
+                )
+            current_scores = []
+            current_rows = []
+
+        in_score_table = False
+        for row in block_rows:
+            joined = " ".join(row)
+            compact_joined = re.sub(r"\s+", "", joined)
+            if ("평가요소" in compact_joined or "평가요소" in joined) and "배점" in joined:
+                in_score_table = True
+                flush()
+                continue
+            if not in_score_table:
+                continue
+            if "기본점수" in joined:
+                if is_overall_basic_score_row(row):
+                    flush()
+                    continue
+                score = row_last_score(row)
+                if score is not None and current_scores and score <= current_scores[-1]:
+                    current_scores.append(score)
+                    current_rows.append(row)
+                    flush()
+                    continue
+                flush()
+                continue
+
+            if (
+                "본인의 의사" in joined
+                or "학업성적관리규정" in joined
+                or "평가요소" in joined
+                and "관련 성취기준" in joined
+            ):
+                flush()
+                break
+
+            score = row_last_score(row)
+            if score is None:
+                continue
+            starts_new = bool(current_scores and score > current_scores[-1])
+            if starts_new and current_scores:
+                flush()
+            current_scores.append(score)
+            current_rows.append(row)
+        flush()
+    return ladders
+
+
+def row_last_score(row: list[str]) -> int | None:
+    for cell in reversed(row):
+        cleaned = clean_cell(cell)
+        if re.fullmatch(r"\d{1,3}", cleaned):
+            return int(cleaned)
+        match = re.match(r"\s*(\d{1,3})\s*\(", cleaned)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def comparable_interval_scores(scores: list[int]) -> list[int]:
+    if len(scores) < 2:
+        return scores
+    collapsed = scores[:]
+    while len(collapsed) >= 2 and collapsed[-1] == collapsed[-2]:
+        collapsed.pop()
+    if len(collapsed) != len(set(collapsed)):
+        return []
+    return collapsed
+
+
+def rubric_row_anchor(row: list[str]) -> str:
+    cleaned = [clean_cell(cell) for cell in row if clean_cell(cell)]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    # Prefer the criterion text immediately before the score cell.
+    return cleaned[-2] if re.fullmatch(r"\d{1,3}", cleaned[-1]) else cleaned[-1]
+
+
+def anchor_candidates(finding: ReviewFinding) -> list[str]:
+    anchors = [finding.anchor_text]
+    if finding.anchor_text == "지필평가":
+        anchors.append("지필 평가")
+    if finding.anchor_text == "서술형":
+        anchors.append("서술 형")
+    point_percent = re.match(r"(\d+(?:\.\d+)?)점\s*\(\s*(\d+(?:\.\d+)?)%\s*\)", finding.anchor_text)
+    if point_percent:
+        point, percent = point_percent.groups()
+        anchors.extend([
+            f"{point}점({percent}%)",
+            f"{point}점 ({percent}%)",
+            f"{point}점  ({percent}%)",
+            f"{point}점",
+            f"{percent}%",
+        ])
+    is_timing_finding = "평가시기" in finding.topic or "평가시기" in finding.memo_text
+    is_score_interval_finding = "배점 급간" in finding.topic
+    if not is_timing_finding:
+        codes = CODE_RE.findall(finding.memo_text)
+        anchors.extend(codes)
+    if is_timing_finding:
+        anchors.extend(re.findall(r"\d+월\s*\d+(?:~\d+)?주", finding.context))
+    if "배점" in finding.topic and not is_score_interval_finding and finding.anchor_text not in {"기본점수", "평가기준", "성취기준"}:
+        anchors.extend(re.findall(r"(?<![0-9])(?:10|9|8|7|6|5|4|3|2)(?![0-9])", finding.context))
+    # Deduplicate while preserving order.
+    seen = set()
+    result = []
+    for anchor in anchors:
+        if anchor and anchor not in seen:
+            seen.add(anchor)
+            result.append(anchor)
+    return result
+
+
+def dedupe_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
+    seen = set()
+    result = []
+    for finding in findings:
+        key = (
+            str(finding.file_path),
+            finding.topic,
+            finding.anchor_text,
+            finding.memo_text,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(finding)
+    return result
