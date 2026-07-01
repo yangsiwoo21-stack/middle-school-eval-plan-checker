@@ -1,4 +1,4 @@
-# Python
+# Python cache
 __pycache__/
 *.py[cod]
 *.pyo
@@ -11,27 +11,32 @@ env/
 
 # Local configuration and secrets
 .env
+secrets.toml
 .streamlit/secrets.toml
 
 # Build artifacts
-build/
-build_*/
 dist/
+build/
 dist_*/
+build_*/
 *.spec.bak
 
-# Runtime outputs
+# Runtime/output folders
+assessment_checker_output/
 uploads/
 outputs/
 output/
 temp/
 tmp/
 memo_copies/
-*_메모첨부.hwpx
-*_메모첨부_새로생성.hwpx
+_github_update_backups/
+
+# Generated review files
 memo_creation_summary.json
 review_results.json
 review_results.csv
+assessment_findings.json
+assessment_findings.csv
 
 # Evaluation plan source/result files
 *.hwpx
@@ -41,24 +46,18 @@ review_results.csv
 *.xls
 *.csv
 *.show
+*_메모첨부.hwpx
+*_메모첨부_새로생성.hwpx
 
-# Internal or sample data folders
+# Local school data folders
 1학기 평가계획 샘플/
 2026학년도 1학기 평가 계획/
 2026학년도 2학기 평가 계획/
 성취수준(2015)/
 성취수준(2022)/
-조민지_선생님_제공용_평가계획점검기/
-*.zip
-
-# Local investigation artifacts
-평가계획 점검기/assessment_checker_app/audit_grade3.py
-평가계획 점검기/assessment_checker_app/semester2_template_notes.json
-
-# Repository-local knowledge/tools not included in the desktop app release
 ai_review_knowledge/
 tools/
-assessment_checker_output/
-평가계획 점검기/assessment_checker_output/
-*.cmd
+
+# Local-only shortcuts and archives
 *.lnk
+*.zip

@@ -80,3 +80,76 @@ python smoke_test.py
 - `uploads/`, `outputs/`, `temp/`, `tmp/`
 - 테스트용 평가계획 원본 파일
 - 학교 내부 자료 또는 개인정보 포함 파일
+
+## 학교 PC와 집 PC에서 작업하는 방법
+
+이 프로젝트는 학교 PC와 집 PC 두 대에서 번갈아 개발할 수 있도록 GitHub를 기준 저장소로 사용합니다. 외장하드 대신 GitHub의 최신 버전을 기준으로 삼고, 작업 시작 전에는 항상 Pull, 작업 종료 후에는 Commit + Push를 진행합니다.
+
+### 작업 시작 전 Pull
+
+작업을 시작하기 전에 저장소 루트에서 아래 파일을 실행합니다.
+
+```cmd
+깃허브 업데이트.bat
+```
+
+직접 명령어로 실행할 경우:
+
+```cmd
+git status
+git fetch
+git pull
+```
+
+### 작업 종료 후 Commit + Push
+
+작업이 끝나면 먼저 인수인계 파일을 최신 상태로 수정합니다.
+
+```text
+WORK_HANDOFF.md
+```
+
+그다음 저장소 루트에서 아래 파일을 실행합니다.
+
+```cmd
+깃허브 업로드.bat
+```
+
+직접 명령어로 실행할 경우:
+
+```cmd
+git status
+git add .
+git status
+git commit -m "작업 내용"
+git push
+```
+
+`WORK_HANDOFF.md`를 수정한 상태에서 `깃허브 업로드.bat`을 실행하면 인수인계 파일도 함께 GitHub에 올라갑니다. 반대로 `깃허브 업데이트.bat`은 GitHub의 최신 내용을 내려받는 파일이므로 업로드는 하지 않습니다.
+
+### 평가계획 원본 파일은 GitHub에 올리지 않기
+
+평가계획 원본과 생성 결과물에는 학교 내부 자료나 개인정보가 포함될 수 있으므로 GitHub에 올리지 않습니다.
+
+올리면 안 되는 대표 파일:
+
+- `.hwpx`
+- `.hwp`
+- `.pdf`
+- `.xlsx`, `.xls`, `.csv`
+- `.env`
+- `secrets.toml`
+- `assessment_checker_output/`
+- `dist/`, `build/`
+- `uploads/`, `outputs/`, `temp/`, `tmp/`
+
+### OneDrive/Google Drive 안에 Git 저장소를 통째로 넣지 않기
+
+Git 저장소 전체를 OneDrive나 Google Drive 동기화 폴더 안에 넣으면 동기화 충돌, 파일 잠금, 권한 문제가 생길 수 있습니다. 가능하면 Git 저장소는 일반 작업 폴더에 두고, 평가계획 원본 문서만 OneDrive/Google Drive에서 따로 관리합니다.
+
+이미 OneDrive 안에서 작업 중이라면 다음 원칙을 지킵니다.
+
+- 작업 시작 전 `update_from_github.bat` 실행
+- 작업 중 OneDrive 동기화가 끝난 뒤 파일 열기
+- 작업 종료 전 `WORK_HANDOFF.md` 업데이트
+- 작업 종료 후 `upload_to_github.bat` 실행
