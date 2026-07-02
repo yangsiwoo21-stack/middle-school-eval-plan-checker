@@ -1,6 +1,6 @@
-# 평가계획 점검 도우미
+# 평가계획 점검 도우미 v0.3
 
-중학교 교수학습 및 평가 운영 계획 HWPX 파일을 로컬 PC에서 점검하는 데스크톱 프로그램입니다. 폴더 또는 단일 파일을 선택하면 평가계획 문서를 분석하고, 오류 후보를 화면 표와 JSON/CSV 결과로 정리하며, 필요한 경우 HWPX 복사본에 메모를 삽입합니다.
+중학교 교수학습 및 평가 운영 계획 HWPX 파일을 로컬 PC에서 점검하는 데스크톱 프로그램입니다. v0.3은 기존 오류 후보 탐지에 더해, 문서를 섹터별로 정리한 엑셀형 Pass/Fail 검토표를 생성합니다.
 
 ## 주요 기능
 
@@ -15,6 +15,13 @@
 - 정기시험 1차/2차 성취기준 중복 의심 점검
 - 수행평가 성취기준과 평가기준 코드 불일치 의심 점검
 - 장기 미인정 결석자, 백지 제출자, 자발적 미참여자 점수 관련 점검
+- 엑셀 검토표 생성
+  - 추출요약
+  - 월별계획
+  - 평가반영비율
+  - 수행평가세부기준
+  - 구역간비교
+  - 진단결과
 - HWPX 복사본에 오류 후보 메모 삽입
 - JSON/CSV 결과 저장
 
@@ -91,7 +98,7 @@
 작업 기준 폴더는 다음 위치입니다.
 
 ```text
-C:\Users\user\Desktop\프로그래밍\평가계획 진단기\평가계획 점검기
+C:\Users\user\Desktop\프로그래밍\평가계획 진단기\평가계획 점검기_v0.3
 ```
 
 작업 기준 폴더에서 바로 실행할 때는 다음 파일을 사용합니다.
@@ -119,7 +126,7 @@ EXE로 패키징한 경우에는 생성된 `평가계획점검기.exe`를 실행
 
 ```text
 middle-school-eval-plan-checker/
-  평가계획 점검기/
+  평가계획 점검기_v0.3/
     평가계획 점검기 실행.cmd
     깃허브 업데이트.bat
     깃허브 업로드.bat
@@ -128,6 +135,7 @@ middle-school-eval-plan-checker/
     assessment_checker_app/
       app.py                       # Tkinter 기반 데스크톱 UI
       checker.py                   # HWPX 파싱 및 규칙 점검 로직
+      excel_review.py              # v0.3 엑셀형 Pass/Fail 검토표 생성
       run_app.ps1                  # PowerShell 실행 스크립트
       smoke_test.py                # 간단 실행 확인용 스크립트
       assets/
@@ -210,6 +218,7 @@ git add WORK_HANDOFF.md launch_app.ps1 "깃허브 업데이트.bat" "깃허브 �
 git add "assessment_checker_app/README.md"
 git add "assessment_checker_app/app.py"
 git add "assessment_checker_app/checker.py"
+git add "assessment_checker_app/excel_review.py"
 git status
 git commit -m "작업 내용"
 git push origin feature/desktop-eval-checker

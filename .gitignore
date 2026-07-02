@@ -30,6 +30,9 @@ temp/
 tmp/
 memo_copies/
 _github_update_backups/
+관내 1학기 평가 계획/
+관내 중등 평가계획/
+조민지_선생님_제공용_평가계획점검기/
 
 # Generated review files
 memo_creation_summary.json
@@ -61,3 +64,6 @@ tools/
 # Local-only shortcuts and archives
 *.lnk
 *.zip
+NEXT_SESSION_HANDOFF.md
+평가계획 점검기/assessment_checker_app/audit_grade3.py
+평가계획 점검기/assessment_checker_app/semester2_template_notes.json

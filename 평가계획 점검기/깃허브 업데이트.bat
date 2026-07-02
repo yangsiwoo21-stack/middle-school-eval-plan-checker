@@ -42,7 +42,7 @@ if errorlevel 1 goto fail
 
 echo.
 echo Running: git pull
-git pull
+git pull origin feature/desktop-eval-checker
 if errorlevel 1 goto fail
 
 echo.

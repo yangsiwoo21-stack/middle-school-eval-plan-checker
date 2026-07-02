@@ -200,6 +200,17 @@ class StandardSector:
     confidence: str
 
 
+@dataclass(frozen=True)
+class AssessmentOverviewItem:
+    name: str
+    ratio: float | None
+    score: int | None
+    achievement_codes: tuple[str, ...]
+    period: str
+    source: str
+    confidence: str
+
+
 def split_combined_subject_document(document: Document) -> list[Document]:
     markers = find_subject_section_markers(document.text)
     if len(markers) < 2:
@@ -368,6 +379,7 @@ class RuleEngine:
 
         mixed_exam_and_performance = "정기시험" in ratio_source and "수행평가" in ratio_source
         seen_ratio_anchors: set[str] = set()
+        overview_items = assessment_overview_items(self.doc)
         for area_name, percent in performance_area_percentages_from_ratio(self.doc):
             if percent > 30:
                 anchor = f"{area_name} {percent:g}%"
@@ -384,17 +396,18 @@ class RuleEngine:
                     ],
                     context=ratio_source[:1800],
                 )
-        for point, percent in POINT_PERCENT_RE.findall(ratio_source):
-            p = float(percent)
-            # In mixed tables, large 80~94 point rows are regular-exam selected-response
-            # cells, not performance areas. The 30% cap is for each performance area.
-            if p > 30 and not (mixed_exam_and_performance and float(point) > 50):
-                self.add(
-                    "상",
-                    "수행평가 한 영역 30% 초과",
-                    f"{point}점 ({percent}%)",
-                    ["한 수행평가 영역 반영비율이 30% 초과", "세부영역 분리 또는 반영비율 조정"],
-                )
+        if not overview_items:
+            for point, percent in POINT_PERCENT_RE.findall(ratio_source):
+                p = float(percent)
+                # In mixed tables, large 80~94 point rows are regular-exam selected-response
+                # cells, not performance areas. The 30% cap is for each performance area.
+                if p > 30 and not (mixed_exam_and_performance and float(point) > 50):
+                    self.add(
+                        "상",
+                        "수행평가 한 영역 30% 초과",
+                        f"{point}점 ({percent}%)",
+                        ["한 수행평가 영역 반영비율이 30% 초과", "세부영역 분리 또는 반영비율 조정"],
+                    )
 
         if ratio_section:
             percentages = [float(x) for x in PERCENT_RE.findall(ratio_section)]
@@ -407,7 +420,7 @@ class RuleEngine:
         section = sector_text(self.doc, "performance_detail", "6. 수행평가", "7.")
         if not section:
             return
-        ratio_scores = performance_area_scores_from_ratio(assessment_ratio_table_rows(self.doc))
+        ratio_scores = performance_area_scores_from_ratio(assessment_ratio_table_rows(self.doc), self.doc)
         if self.doc.table_rows:
             score_rows = extract_basic_score_rows_from_tables(self.doc.table_rows, ratio_scores)
         else:
@@ -429,7 +442,7 @@ class RuleEngine:
                 )
 
     def _check_performance_detail_scores(self) -> None:
-        ratio_scores = performance_area_scores_from_ratio(assessment_ratio_table_rows(self.doc))
+        ratio_scores = performance_area_scores_from_ratio(assessment_ratio_table_rows(self.doc), self.doc)
         if not ratio_scores or not self.doc.table_rows:
             return
         detail_blocks = performance_detail_blocks_from_tables(self.doc.table_rows)
@@ -1081,16 +1094,16 @@ def has_regular_exam_ratio(text: str) -> bool:
 SECTOR_PATTERNS: list[tuple[str, str, tuple[str, ...]]] = [
     ("document_info", "문서 기본 정보", (r"2026학년도[\s\S]{0,120}?교수\s*[·ㆍ∙]?\s*학습\s*및\s*평가", r"학교명\s+학년\s+과목\s+학기")),
     ("monthly_plan", "교수·학습 운영 계획", (r"교수\s*[·ㆍ∙]?\s*학습\s*운영\s*계획", r"월\s+주\s+단원명")),
-    ("purpose", "평가의 목적", (r"(?:^|\n)\s*1\.\s*평가의\s*목적", r"평가의\s*목적")),
-    ("direction", "평가의 기본 방향과 방침", (r"(?:^|\n)\s*2\.\s*평가의\s*기본\s*방향(?:과|및)?\s*방침", r"평가의\s*기본\s*방향")),
-    ("achievement_level", "성취기준 및 성취수준", (r"(?:^|\n)\s*3\.\s*성취기준\s*및\s*성취수준", r"성취기준별\s*성취수준", r"학기\s*단위\s*성취수준")),
-    ("assessment_overview", "평가의 종류와 반영비율", (r"(?:^|\n)\s*4\.\s*(?:\n|\s)*평가의\s*종류\s*와\s*반영\s*비율", r"평가\s*종류[\s\S]{0,120}?반영\s*비율")),
-    ("achievement_rate", "성취율과 성취도", (r"(?:^|\n)\s*(?:5|6)\.\s*성취율\s*과\s*성취도", r"성취율\s*과\s*성취도")),
-    ("performance_detail", "수행평가 세부기준", (r"(?:^|\n)\s*(?:5|6)\.\s*(?:\n|\s)*수행평가\s*세부\s*기준", r"수행평가\s*세부\s*기준", r"평가영역명[\s\S]{0,80}?\(\d{1,3}점\)")),
-    ("affective", "정의적 능력 평가", (r"(?:^|\n)\s*(?:6|7)\.\s*(?:\n|\s)*정의적\s*능력\s*평가", r"정의적\s*능력")),
-    ("absence", "수행평가 미응시자 및 학적변동자 성적처리", (r"(?:^|\n)\s*(?:7|8)\.\s*(?:\n|\s)*수행평가\s*미응시자", r"미응시자\s*및\s*학적\s*변동자", r"학적\s*변동자\s*처리", r"학적\s*변동자\s*성적처리")),
-    ("notice", "평가 유의사항", (r"(?:^|\n)\s*(?:8|9)\.\s*(?:\n|\s)*평가\s*유의사항", r"평가\s*유의\s*사항")),
-    ("analysis", "평가 결과 분석 및 활용", (r"(?:^|\n)\s*(?:9|10)\.\s*(?:\n|\s)*평가\s*결과\s*분석", r"평가\s*결과\s*분석\s*및\s*활용")),
+    ("purpose", "평가의 목적", (r"(?:^|\n)\s*1\s*(?:\.|\n|\s)+평가의\s*목적", r"평가의\s*목적")),
+    ("direction", "평가의 기본 방향과 방침", (r"(?:^|\n)\s*2\s*(?:\.|\n|\s)+평가의\s*기본\s*방향(?:과|및)?\s*방침", r"평가의\s*기본\s*방향")),
+    ("achievement_level", "성취기준 및 성취수준", (r"(?:^|\n)\s*3\s*(?:\.|\n|\s)+성취기준\s*및\s*성취수준", r"(?:^|\n)\s*3\s*(?:\.|\n|\s)+성취기준\s*및\s*평가기준", r"성취기준별\s*성취수준", r"학기\s*단위\s*성취수준")),
+    ("assessment_overview", "평가의 종류와 반영비율", (r"(?:^|\n)\s*4\s*(?:\.|\n|\s)+평가의\s*종류\s*와\s*반영\s*비율", r"(?:^|\n)\s*4\s*(?:\.|\n|\s)+평가의\s*종류\s*와\s*반영비율", r"평가\s*종류[\s\S]{0,120}?반영\s*비율")),
+    ("achievement_rate", "성취율과 성취도", (r"(?:^|\n)\s*(?:5|6)\s*(?:\.|\n|\s)+성취율\s*과\s*성취도", r"성취율\s*과\s*성취도")),
+    ("performance_detail", "수행평가 세부기준", (r"(?:^|\n)\s*(?:5|6)\s*(?:\.|\n|\s)+수행평가\s*세부\s*기준", r"평가영역명[\s\S]{0,80}?\(\d{1,3}점\)")),
+    ("affective", "정의적 능력 평가", (r"(?:^|\n)\s*(?:6|7)\s*(?:\.|\n|\s)+정의적\s*능력\s*평가", r"정의적\s*능력")),
+    ("absence", "수행평가 미응시자 및 학적변동자 성적처리", (r"(?:^|\n)\s*(?:7|8)\s*(?:\.|\n|\s)+수행평가\s*미응시자", r"미응시자\s*및\s*학적\s*변동자", r"학적\s*변동자\s*처리", r"학적\s*변동자\s*성적처리")),
+    ("notice", "평가 유의사항", (r"(?:^|\n)\s*(?:8|9)\s*(?:\.|\n|\s)+평가\s*유의사항", r"평가\s*유의\s*사항")),
+    ("analysis", "평가 결과 분석 및 활용", (r"(?:^|\n)\s*(?:9|10)\s*(?:\.|\n|\s)+평가\s*결과\s*분석", r"평가\s*결과\s*분석\s*및\s*활용")),
 ]
 
 
@@ -1599,12 +1612,104 @@ def extract_overall_basic_score_from_block(block: str) -> int | None:
 
 
 def performance_area_names_from_ratio(doc: Document) -> list[str]:
+    items = assessment_overview_items(doc)
+    if items:
+        return [item.name for item in items]
     rows = assessment_ratio_table_rows(doc)
     names = performance_area_names_from_ratio_rows(rows)
     if names:
         return names
     section = sector_text(doc, "assessment_overview", "4. 평가의 종류", "5.")
     return performance_area_names_from_ratio_text(section)
+
+
+def assessment_overview_items(doc: Document) -> list[AssessmentOverviewItem]:
+    section = sector_text(doc, "assessment_overview", "4. 평가의 종류", "5.")
+    items = assessment_overview_items_from_text(section)
+    if items:
+        return items
+    return assessment_overview_items_from_rows(assessment_ratio_table_rows(doc))
+
+
+def assessment_overview_items_from_text(section: str) -> list[AssessmentOverviewItem]:
+    if not section:
+        return []
+    names = performance_area_names_from_ratio_text(section)
+    if not names:
+        return []
+    pairs = score_ratio_pairs_from_text(section)
+    periods = periods_from_overview_text(section)
+    codes = tuple(sorted(set(CODE_RE.findall(section))))
+    paired = pairs[-len(names):] if len(pairs) >= len(names) else []
+    items: list[AssessmentOverviewItem] = []
+    for index, name in enumerate(names):
+        score: int | None = None
+        ratio: float | None = None
+        if paired:
+            score, ratio = paired[index]
+        period = periods[-len(names) + index] if len(periods) >= len(names) else ""
+        confidence = "높음" if paired else "확인 필요"
+        items.append(AssessmentOverviewItem(name, ratio, score, codes, period, section[:1800], confidence))
+    return items
+
+
+def assessment_overview_items_from_rows(rows: list[list[str]]) -> list[AssessmentOverviewItem]:
+    names = performance_area_names_from_ratio_rows(rows)
+    if not names:
+        return []
+    score_cells = table_row_text_cells(rows, "영역 만점")
+    pairs: list[tuple[int, float]] = []
+    for cell in score_cells:
+        match = re.search(r"(\d{1,3})\s*점\s*\(?\s*(\d+(?:\.\d+)?)\s*%\s*\)?", cell)
+        if match:
+            score, ratio = match.groups()
+            pairs.append((int(score), float(ratio)))
+            continue
+        score_match = re.search(r"(\d{1,3})\s*점", cell)
+        if score_match:
+            pairs.append((int(score_match.group(1)), None))  # type: ignore[arg-type]
+    pairs = [(score, ratio) for score, ratio in pairs if score != 100 and ratio != 100]
+    pairs = pairs[-len(names):] if len(pairs) >= len(names) else []
+    periods = table_row_text_cells(rows, "평가 시기")
+    codes = tuple(sorted(set(CODE_RE.findall(table_rows_text(rows)))))
+    items: list[AssessmentOverviewItem] = []
+    for index, name in enumerate(names):
+        score: int | None = None
+        ratio: float | None = None
+        if pairs:
+            score, ratio = pairs[index]
+        period = periods[-len(names) + index] if len(periods) >= len(names) else ""
+        items.append(AssessmentOverviewItem(name, ratio, score, codes, period, table_rows_text(rows[:12]), "높음" if pairs else "확인 필요"))
+    return items
+
+
+def score_ratio_pairs_from_text(section: str) -> list[tuple[int, float]]:
+    segment = section
+    start = segment.find("영역 만점")
+    if start >= 0:
+        segment = segment[start:]
+    end_candidates = [idx for marker in ("논술형 평가", "성취기준", "평가요소", "평가 시기") if (idx := segment.find(marker)) > 0]
+    if end_candidates:
+        segment = segment[: min(end_candidates)]
+    pairs: list[tuple[int, float]] = []
+    for score, ratio in re.findall(r"(\d{1,3})\s*점\s*\(?\s*(\d+(?:\.\d+)?)\s*%\s*\)?", segment):
+        score_int = int(score)
+        ratio_float = float(ratio)
+        if score_int == 100 and ratio_float == 100:
+            continue
+        pairs.append((score_int, ratio_float))
+    return pairs
+
+
+def periods_from_overview_text(section: str) -> list[str]:
+    start = section.find("평가 시기")
+    if start < 0:
+        return []
+    segment = section[start:]
+    periods = []
+    for month, week in re.findall(r"([3-7])\s*월\s*([1-5])\s*주", segment):
+        periods.append(f"{month}월 {week}주")
+    return periods
 
 
 def performance_area_names_from_ratio_rows(rows: list[list[str]]) -> list[str]:
@@ -1617,8 +1722,9 @@ def performance_area_names_from_ratio_rows(rows: list[list[str]]) -> list[str]:
         skip = 2 if "1차" in source_text and "2차" in source_text else 1
     result = []
     for name in names[skip:]:
-        normalized = normalize_area_name(name)
-        if not normalized or normalized in {"선택형", "논술형", "1차", "2차", "합계"}:
+        if is_assessment_type_cell(name) and result:
+            break
+        if not is_valid_performance_area_name(name):
             continue
         result.append(name)
     return result
@@ -1637,9 +1743,9 @@ def performance_area_names_from_ratio_text(section: str) -> list[str]:
         compact = re.sub(r"\s+", "", line)
         if compact.startswith(("성취기준", "반영비율", "논술형평가", "평가요소", "MYP", "평가시기")):
             break
-        if compact in {"선택형", "논술형", "정기시험", "수행평가", "합계", "-", ""}:
-            continue
-        if re.fullmatch(r"\d{1,3}%|\d{1,3}점.*|100%", compact):
+        if is_assessment_type_cell(line) and result:
+            break
+        if not is_valid_performance_area_name(line):
             continue
         if line.startswith("(") and result:
             result[-1] = f"{result[-1]} {line}"
@@ -1648,7 +1754,60 @@ def performance_area_names_from_ratio_text(section: str) -> list[str]:
     return [name for name in result if normalize_area_name(name)]
 
 
+def is_assessment_type_cell(value: str) -> bool:
+    compact = re.sub(r"\s+", "", clean_cell(value))
+    return compact in {
+        "선택형",
+        "논술형",
+        "서술형",
+        "프로젝트형",
+        "실기형",
+        "실습형",
+        "실기·실습",
+        "실기실습",
+        "구술발표",
+        "구술·발표",
+        "포트폴리오",
+    }
+
+
+def is_valid_performance_area_name(value: str) -> bool:
+    cleaned = clean_cell(value)
+    compact = re.sub(r"\s+", "", cleaned)
+    if not compact or len(compact) < 2:
+        return False
+    invalid_exact = {
+        "1차",
+        "2차",
+        "합계",
+        "정기시험",
+        "수행평가",
+        "평가종류",
+        "평가유형",
+        "반영비율",
+        "논술형평가",
+        "영역",
+        "시기/영역",
+        "영역/방법",
+        "-",
+    }
+    if compact in invalid_exact or is_assessment_type_cell(cleaned):
+        return False
+    if any(label in compact for label in ("영역만점", "반영비율", "성취기준", "평가요소", "평가시기")):
+        return False
+    if re.fullmatch(r"(?:[12]차)?\(?\d+(?:\.\d+)?\(?%\)?\)?|\d+점|\d+", compact):
+        return False
+    if re.fullmatch(r"[12]차\(?\d+(?:\.\d+)?%\)?", compact):
+        return False
+    if CODE_RE.search(cleaned):
+        return False
+    return True
+
+
 def performance_area_percentages_from_ratio(doc: Document) -> list[tuple[str, float]]:
+    items = assessment_overview_items(doc)
+    if items:
+        return [(item.name, item.ratio) for item in items if item.ratio is not None]
     names = performance_area_names_from_ratio(doc)
     if not names:
         return []
@@ -1684,7 +1843,11 @@ def performance_area_percentages_from_ratio(doc: Document) -> list[tuple[str, fl
     return []
 
 
-def performance_area_scores_from_ratio(rows: list[list[str]]) -> dict[str, int]:
+def performance_area_scores_from_ratio(rows: list[list[str]], doc: Document | None = None) -> dict[str, int]:
+    if doc is not None:
+        items = assessment_overview_items(doc)
+        if items:
+            return {normalize_area_name(item.name): item.score for item in items if item.score is not None}
     names = table_row_text_cells(rows, "시기/영역")
     score_cells = table_row_text_cells(rows, "영역 만점")
     if not names or not score_cells:
@@ -1977,12 +2140,34 @@ def extract_text_element_score_mismatches(section: str) -> list[tuple[str, int, 
         if index + 1 >= len(lines):
             return False
         name = lines[index]
-        if len(name) > 80:
+        if len(name) > 80 or len(name) < 2:
             return False
         compact_name = re.sub(r"\s+", "", name)
-        if compact_name in {"평가요소", "채점기준", "배점", "기본점수", "영역만점", "반영비율", "평가종류"}:
+        if compact_name in {"평가요소", "채점기준", "배점", "기본점수", "영역만점", "반영비율", "평가종류", "평가영역명"}:
             return False
-        if compact_name.startswith(("평가영역명", "교육과정", "평가기준", "평가방법", "자발적", "장기", "본인의", "논술형평가")):
+        if compact_name.startswith(
+            (
+                "평가영역명",
+                "교육과정",
+                "성취기준",
+                "평가기준",
+                "평가방법",
+                "평가시기",
+                "반영비율",
+                "영역만점",
+                "자발적",
+                "장기",
+                "본인의",
+                "백지",
+                "평가요소중",
+                "학업성적관리규정",
+                "논술형평가",
+            )
+        ):
+            return False
+        if "%" in compact_name or re.fullmatch(r"\(?\d{1,3}\s*(?:점|%)?\)?", compact_name):
+            return False
+        if len(CODE_RE.findall(name)) > 0:
             return False
         return re.fullmatch(r"\(?\s*\d{1,3}\s*점\s*\)?", lines[index + 1]) is not None
 
@@ -1997,7 +2182,12 @@ def extract_text_element_score_mismatches(section: str) -> list[tuple[str, int, 
         if current_name and current_score and current_scores:
             max_score = max(current_scores)
             key = (current_name, current_score, max_score)
-            if max_score != current_score and key not in seen_keys:
+            # HWPX text extraction often interleaves side-by-side rubric columns.
+            # Treat a mismatch as reliable only when the element score itself
+            # appears in the same score ladder; otherwise leave it to table-based
+            # parsing or human confirmation instead of creating a false error.
+            high_confidence = current_score in current_scores and max_score <= current_score + 5
+            if high_confidence and max_score != current_score and key not in seen_keys:
                 seen_keys.add(key)
                 result.append((current_name, current_score, max_score, "\n".join(current_context[:18])))
         current_name = None
@@ -2015,8 +2205,26 @@ def extract_text_element_score_mismatches(section: str) -> list[tuple[str, int, 
             index += 2
             continue
         if current_name:
-            if lines[index].startswith(("기본점수", "자발적", "장기", "학업성적관리규정")):
+            compact_line = re.sub(r"\s+", "", lines[index])
+            if (
+                is_element_start(index)
+                or compact_line.startswith(
+                    (
+                        "기본점수",
+                        "자발적",
+                        "장기",
+                        "본인의",
+                        "백지",
+                        "평가요소중",
+                        "모든항목",
+                        "모든평가요소",
+                        "학업성적관리규정",
+                    )
+                )
+            ):
                 flush()
+                if is_element_start(index):
+                    continue
                 index += 1
                 continue
             score = line_score(lines[index])

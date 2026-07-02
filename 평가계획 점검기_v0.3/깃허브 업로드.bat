@@ -51,8 +51,17 @@ if "%COMMIT_MSG%"=="" (
 )
 
 echo.
-echo Running: git add .
-git add .
+echo Running: safe git add
+git add "../.gitignore"
+git add WORK_HANDOFF.md launch_app.ps1 "깃허브 업데이트.bat" "깃허브 업로드.bat" "평가계획 점검기 실행.cmd"
+git add "assessment_checker_app/app.py"
+git add "assessment_checker_app/checker.py"
+git add "assessment_checker_app/excel_review.py"
+git add "assessment_checker_app/README.md"
+git add "assessment_checker_app/run_app.ps1"
+git add "assessment_checker_app/smoke_test.py"
+git add "assessment_checker_app/평가계획점검기.spec"
+git add "assessment_checker_app/assets"
 if errorlevel 1 goto fail
 
 echo.
