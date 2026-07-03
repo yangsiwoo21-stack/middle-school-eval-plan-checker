@@ -1,0 +1,256 @@
+# 평가계획 점검 도우미 v0.3
+
+중학교 교수학습 및 평가 운영 계획 HWPX 파일을 로컬 PC에서 점검하는 데스크톱 프로그램입니다. v0.3은 기존 오류 후보 탐지에 더해, 문서를 섹터별로 정리한 엑셀형 Pass/Fail 검토표를 생성합니다.
+
+## 주요 기능
+
+- HWPX 평가계획 파일 직접 읽기
+- 학년, 과목, 학기 정보 추정
+- 학년별 교육과정 기준 적용
+  - 1, 2학년: 2022 개정 교육과정 기준
+  - 3학년: 2015 개정 교육과정 기준
+- 합본 HWPX 파일을 과목별 문서로 분리하여 점검
+- 평가의 종류와 반영비율 표 분석
+- 수행평가 영역, 기본점수, 평가요소 최하점 범위 점검
+- 정기시험 1차/2차 성취기준 중복 의심 점검
+- 수행평가 성취기준과 평가기준 코드 불일치 의심 점검
+- 장기 미인정 결석자, 백지 제출자, 자발적 미참여자 점수 관련 점검
+- 엑셀 검토표 생성
+  - 추출요약
+  - 월별계획
+  - 평가반영비율
+  - 수행평가세부기준
+  - 구역간비교
+  - 진단결과
+- HWPX 복사본에 오류 후보 메모 삽입
+- JSON/CSV 결과 저장
+
+## 표준 섹터 기준 및 검토 항목
+
+### 분석 원칙
+
+- 조민지 선생님이 제공한 2026학년도 2학기 교수학습 및 평가운영계획 양식을 표준 섹터 기준으로 삼습니다.
+- 전체 문서 단어 검색보다 섹터 기반 검사를 우선합니다.
+- 목차, 안내문, 메모, 참고용 문구는 실제 평가값으로 판단하지 않습니다.
+- 섹터 제목이 완전히 같지 않아도 유사 제목으로 인식합니다.
+- 섹터가 누락되면 즉시 오류로 단정하지 않고 우선 “확인 필요”로 분류합니다.
+- 표는 단순 텍스트가 아니라 행, 열, 셀 구조를 우선하여 분석합니다.
+- 4번 평가의 종류와 반영비율, 6번 수행평가 세부기준, 8번 미응시자 및 학적변동자 처리는 특히 구역 간 비교를 우선합니다.
+
+### 섹터 내부 검사 기준
+
+| 섹터 ID | 문서 구역 | 시작 기준 | 종료 기준 | 주요 추출 정보 | 구역 내부 검사 항목 | 대표 오류 |
+|---|---|---|---|---|---|---|
+| document_info | 문서 기본 정보 | 2026학년도, 학년, 과목, 학기, 지도교사 표기 | 교수·학습 운영 계획 시작 전 | 학교명, 학년, 과목, 학기, 학급, 지도교사 | 학년·과목·학기 추정 가능 여부 | 학년 미표기, 과목명 불명확 |
+| monthly_plan | 교수·학습 운영 계획 | “교수·학습 운영 계획”, 월별 운영표 | 평가 세부 계획 시작 전 | 월, 주, 단원, 성취기준, 수업 방법, 평가방법, 수업·평가 연계 | 수행평가 시기와 성취기준이 사전에 제시되었는지 확인 | 수행평가 연계 누락, 평가 시기 이전 성취기준 미등장 |
+| purpose | 평가의 목적 | “1. 평가의 목적” | “2. 평가의 기본 방향과 방침” 전 | 평가 목적 서술 | 참고용 문구 잔존 여부, 교과 특성 반영 여부 | 예시 문구 미삭제, 교과 목적과 무관한 일반 문구 |
+| direction | 평가의 기본 방향과 방침 | “2. 평가의 기본 방향과 방침” | “3. 성취기준 및 성취수준” 전 | 정기시험 운영, 수행평가 운영, 결과물 처리 방침 | 정기시험 횟수와 4번 평가표 일치 여부 | 방침에는 2회 시험인데 평가표는 1회만 있음 |
+| achievement_level | 성취기준 및 성취수준 | “3. 성취기준 및 성취수준” | “4. 평가의 종류와 반영비율” 전 | 교육과정, 성취기준, 성취수준, 평가기준 | 학년별 교육과정 적용, 성취기준 코드 존재 여부 | 1·2학년 2022 성취수준 누락, 3학년 2015 기준 불명확 |
+| assessment_overview | 평가의 종류와 반영비율 | “4. 평가의 종류와 반영비율” | “5. 성취율과 성취도” 전 | 평가 종류, 반영비율, 영역명, 영역 만점, 성취기준, 평가요소, 평가시기 | 합계 100%, 수행평가 영역 30% 초과, 논술형 비율, 영역명 중복 | 반영비율 합계 오류, 수행평가 한 영역 30% 초과 |
+| achievement_rate | 성취율과 성취도 | “5. 성취율과 성취도” | “6. 수행평가 세부기준” 전 | 성취율 구간, 성취도 체계 | 교과별 A~E 또는 A~C 체계 확인 | 체육·예술 교과 성취도 체계 오류 |
+| performance_detail | 수행평가 세부기준 | “6. 수행평가 세부기준”, 평가영역명 | “7. 정의적 능력 평가” 또는 “8. 미응시자” 전 | 평가영역명, 영역만점, 성취기준, 평가기준, 평가요소, 배점, 기본점수 | 영역만점, 기본점수 20~40%, 평가요소 최하점, 배점 급간, 성취기준 불일치 | 기본점수 범위 오류, 평가요소 만점·채점표 배점 불일치 |
+| affective | 정의적 능력 평가 | “7. 정의적 능력 평가” | “8. 미응시자 및 학적변동자” 전 | 정의적 능력 평가 방법과 반영 방식 | 실제 성적 반영 여부, 안내 문구 잔존 여부 | 정의적 평가 반영 방식 불명확 |
+| absence | 수행평가 미응시자 및 학적변동자 성적처리 | “8. 수행평가 미응시자 및 학적변동자 성적처리” | “9. 평가 유의사항” 전 | 백지 제출자, 자발적 미참여자, 장기 미인정 결석자 처리 점수 | 6번 기본점수와 미응시자 점수 비교 | 백지 제출자 점수가 기본점수 초과, 장기 미인정 결석자 차하점 미적용 |
+| notice | 평가 유의사항 | “9. 평가 유의사항” | “10. 평가 결과 분석 및 활용” 전 | 평가 안내, 유의사항, 학생 안내 문구 | 실제 평가값으로 오인하지 않도록 제외 또는 확인 | 안내문 숫자를 배점으로 오인 |
+| analysis | 평가 결과 분석 및 활용 | “10. 평가 결과 분석 및 활용” | 문서 끝 또는 다음 과목 시작 전 | 평가 결과 환류, 분석·활용 계획 | 참고용 문구 잔존 여부 | 분석 및 활용 내용 미작성 |
+
+### 구역 간 비교 검사 기준
+
+| 비교 구역 | 비교 목적 | 비교할 데이터 | 잡아야 할 대표 오류 | 우선순위 |
+|---|---|---|---|---|
+| monthly_plan ↔ assessment_overview | 월별 계획과 평가표의 수행평가 연계 확인 | 수행평가명, 평가시기, 성취기준 | 월별 계획에 수행평가 연계 누락, 평가 시기 이전 성취기준 미등장 | 2순위 |
+| direction ↔ assessment_overview | 평가 방침과 실제 평가표 일치 확인 | 정기시험 횟수, 수행평가 반영 방식, 만점 처리 | 방침과 평가표의 정기시험 횟수 불일치 | 2순위 |
+| achievement_level ↔ assessment_overview | 평가표 성취기준의 교육과정 근거 확인 | 교육과정 성취기준 코드, 학년별 교육과정 | 평가표 성취기준이 성취수준 섹터에 없음 | 2순위 |
+| achievement_level ↔ performance_detail | 수행평가 세부기준의 성취기준 근거 확인 | 수행평가 성취기준, 평가기준 코드 | 다른 영역 성취기준 혼입, 코드 오기 | 2순위 |
+| assessment_overview ↔ performance_detail | 4번 평가표와 6번 세부기준 일치 확인 | 영역명, 성취기준, 만점, 평가요소, 평가시기 | 영역명 불일치, 영역만점 불일치, 평가시기 불일치 | 1순위 |
+| performance_detail ↔ absence | 수행평가 기본점수와 미응시자 처리 점수 비교 | 기본점수, 백지 제출자, 자발적 미참여자, 장기 미인정 결석자 점수 | 미응시자 점수가 기본점수 초과, 장기 미인정 결석자 차하점 오류 | 1순위 |
+| assessment_overview ↔ achievement_rate | 반영비율과 성취도 산출 기준 확인 | 평가 합계, 성취율, 성취도 체계 | 평가 합계와 성취율 산출 기준 불일치 | 2순위 |
+| performance_detail ↔ notice | 세부기준과 안내문 충돌 확인 | 제출 조건, 결시 처리, 기본점수 안내 | 안내문과 세부기준의 점수 처리 기준 불일치 | 3순위 |
+
+### 구현 우선순위
+
+1순위:
+
+- 과목별 문서 분리
+- 표준 섹터 분리
+- assessment_overview 내부 검사
+- performance_detail 내부 검사
+- assessment_overview ↔ performance_detail 비교
+- performance_detail ↔ absence 비교
+
+2순위:
+
+- monthly_plan ↔ assessment_overview 비교
+- achievement_level ↔ assessment_overview 비교
+- achievement_level ↔ performance_detail 비교
+- direction ↔ assessment_overview 비교
+- assessment_overview ↔ achievement_rate 비교
+
+3순위:
+
+- performance_detail ↔ notice 비교
+- AI 활용 유의사항 정밀 검사
+- 수행과제의 과제형·암기식 여부 판단
+- 채점기준 문장 품질 검사
+
+## 실행 방법
+
+작업 기준 폴더는 다음 위치입니다.
+
+```text
+C:\Users\user\Desktop\프로그래밍\평가계획 진단기\평가계획 점검기_v0.3
+```
+
+작업 기준 폴더에서 바로 실행할 때는 다음 파일을 사용합니다.
+
+```cmd
+평가계획 점검기 실행.cmd
+```
+
+Python으로 직접 실행할 때는 작업 기준 폴더에서 프로그램 폴더로 이동한 뒤 실행합니다.
+
+```powershell
+cd assessment_checker_app
+python app.py
+```
+
+PowerShell 실행 스크립트를 사용할 수도 있습니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ".\run_app.ps1"
+```
+
+EXE로 패키징한 경우에는 생성된 `평가계획점검기.exe`를 실행하면 됩니다. 단, `dist/`, `build/` 등 패키징 산출물은 GitHub 저장소에 포함하지 않습니다.
+
+## 파일 구조
+
+```text
+middle-school-eval-plan-checker/
+  평가계획 점검기_v0.3/
+    평가계획 점검기 실행.cmd
+    깃허브 업데이트.bat
+    깃허브 업로드.bat
+    launch_app.ps1
+    WORK_HANDOFF.md
+    assessment_checker_app/
+      app.py                       # Tkinter 기반 데스크톱 UI
+      checker.py                   # HWPX 파싱 및 규칙 점검 로직
+      excel_review.py              # v0.3 엑셀형 Pass/Fail 검토표 생성
+      run_app.ps1                  # PowerShell 실행 스크립트
+      smoke_test.py                # 간단 실행 확인용 스크립트
+      assets/
+        pomeranian_icon.ico
+        pomeranian_mascot.png
+```
+
+## 개발 확인
+
+문법 검사는 다음 명령으로 실행할 수 있습니다.
+
+```powershell
+python -m py_compile app.py checker.py
+```
+
+간단한 동작 확인은 다음 명령으로 실행합니다.
+
+```powershell
+python smoke_test.py
+```
+
+## GitHub 포함 제외 대상
+
+평가계획 원본 파일, 결과 파일, 학교 내부 자료, 개인정보가 포함될 수 있는 파일은 저장소에 올리지 않습니다.
+
+제외 대상 예시는 다음과 같습니다.
+
+- `*.hwpx`, `*.hwp`
+- `*.pdf`
+- `*.xlsx`, `*.xls`, `*.csv`
+- `.env`
+- `.streamlit/secrets.toml`
+- `__pycache__/`
+- `.venv/`, `venv/`
+- `dist/`, `build/`
+- `uploads/`, `outputs/`, `temp/`, `tmp/`
+- 테스트용 평가계획 원본 파일
+- 학교 내부 자료 또는 개인정보 포함 파일
+
+## 학교 PC와 집 PC에서 작업하는 방법
+
+이 프로젝트는 학교 PC와 집 PC 두 대에서 번갈아 개발할 수 있도록 GitHub를 기준 저장소로 사용합니다. 외장하드 대신 GitHub의 최신 버전을 기준으로 삼고, 작업 시작 전에는 항상 Pull, 작업 종료 후에는 Commit + Push를 진행합니다.
+
+### 작업 시작 전 Pull
+
+작업을 시작하기 전에 작업 기준 폴더에서 아래 파일을 실행합니다.
+
+```cmd
+깃허브 업데이트.bat
+```
+
+직접 명령어로 실행할 경우:
+
+```cmd
+git status
+git fetch
+git pull origin feature/desktop-eval-checker
+```
+
+### 작업 종료 후 Commit + Push
+
+작업이 끝나면 먼저 인수인계 파일을 최신 상태로 수정합니다.
+
+```text
+WORK_HANDOFF.md
+```
+
+그다음 작업 기준 폴더에서 아래 파일을 실행합니다.
+
+```cmd
+깃허브 업로드.bat
+```
+
+직접 명령어로 실행할 경우:
+
+```cmd
+git status
+git add "../.gitignore"
+git add WORK_HANDOFF.md launch_app.ps1 "깃허브 업데이트.bat" "깃허브 업로드.bat" "평가계획 점검기 실행.cmd"
+git add "assessment_checker_app/README.md"
+git add "assessment_checker_app/app.py"
+git add "assessment_checker_app/checker.py"
+git add "assessment_checker_app/excel_review.py"
+git status
+git commit -m "작업 내용"
+git push origin feature/desktop-eval-checker
+```
+
+필요한 파일만 `git add`합니다. 평가계획 원본, 결과 파일, 학교 내부 자료가 `git status`에 보이면 먼저 `.gitignore`를 확인하고 커밋에서 제외합니다.
+
+`WORK_HANDOFF.md`를 수정한 상태에서 `깃허브 업로드.bat`을 실행하면 인수인계 파일도 함께 GitHub에 올라갑니다. 반대로 `깃허브 업데이트.bat`은 GitHub의 최신 내용을 내려받는 파일이므로 업로드는 하지 않습니다.
+
+### 평가계획 원본 파일은 GitHub에 올리지 않기
+
+평가계획 원본과 생성 결과물에는 학교 내부 자료나 개인정보가 포함될 수 있으므로 GitHub에 올리지 않습니다.
+
+올리면 안 되는 대표 파일:
+
+- `.hwpx`
+- `.hwp`
+- `.pdf`
+- `.xlsx`, `.xls`, `.csv`
+- `.env`
+- `secrets.toml`
+- `assessment_checker_output/`
+- `dist/`, `build/`
+- `uploads/`, `outputs/`, `temp/`, `tmp/`
+
+### OneDrive/Google Drive 안에 Git 저장소를 통째로 넣지 않기
+
+Git 저장소 전체를 OneDrive나 Google Drive 동기화 폴더 안에 넣으면 동기화 충돌, 파일 잠금, 권한 문제가 생길 수 있습니다. 가능하면 Git 저장소는 일반 작업 폴더에 두고, 평가계획 원본 문서만 OneDrive/Google Drive에서 따로 관리합니다.
+
+이미 OneDrive 안에서 작업 중이라면 다음 원칙을 지킵니다.
+
+- 작업 시작 전 `update_from_github.bat` 실행
+- 작업 중 OneDrive 동기화가 끝난 뒤 파일 열기
+- 작업 종료 전 `WORK_HANDOFF.md` 업데이트
+- 작업 종료 후 `upload_to_github.bat` 실행
