@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='평가계획점검기',
+    name='평가계획점검기_v0.3_배포용',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

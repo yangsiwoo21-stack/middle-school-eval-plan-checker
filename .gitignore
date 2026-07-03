@@ -19,6 +19,10 @@ dist/
 build/
 dist_*/
 build_*/
+*배포용/
+*배포용.exe
+*전체기능/
+*전체기능.exe
 *.spec.bak
 
 # Runtime/output folders
@@ -64,6 +68,7 @@ tools/
 # Local-only shortcuts and archives
 *.lnk
 *.zip
+*.7z
 NEXT_SESSION_HANDOFF.md
 평가계획 점검기/assessment_checker_app/audit_grade3.py
 평가계획 점검기/assessment_checker_app/semester2_template_notes.json

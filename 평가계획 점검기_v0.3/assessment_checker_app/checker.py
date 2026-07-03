@@ -310,7 +310,6 @@ class RuleEngine:
         self._check_regular_exam_duplicate_codes()
         self._check_performance_timing_codes()
         self._check_subject_achievement_level()
-        self._check_performance_criteria_mismatch()
         self._check_performance_detail_scores()
         self._check_performance_area_name_consistency()
         self._check_performance_linkage_presence()
@@ -487,26 +486,22 @@ class RuleEngine:
             )
 
     def _check_performance_linkage_presence(self) -> None:
-        ratio_names = performance_area_names_from_ratio(self.doc)
-        if not ratio_names:
+        overview_items = [item for item in assessment_overview_items(self.doc) if item.period and "수시" not in item.period]
+        if not overview_items:
             return
         plan_text = sector_text(self.doc, "monthly_plan") or monthly_plan_text(self.doc.text)
         if not plan_text:
             return
-        normalized_plan = normalize_area_name(plan_text)
-        for area_name in ratio_names:
-            normalized = normalize_area_name(area_name)
-            if not normalized:
-                continue
-            if normalized in normalized_plan:
+        for item in overview_items:
+            if period_has_assessment_linkage(plan_text, item.period, self.doc.table_rows, item.name):
                 continue
             self.add(
-                "중",
+                "하",
                 "교수학습 운영계획 수업·평가 연계 누락",
-                area_name,
+                item.period,
                 [
-                    f"4번 수행평가 영역 '{area_name}'이 월별 교수학습 운영계획의 수업·평가 연계 내용에서 확인되지 않음",
-                    "월별 운영계획에 해당 수행평가명 또는 연계 평가 활동을 명시",
+                    f"4번 평가표의 '{item.name}' 평가시기({item.period})에 해당하는 월별 계획표 구간에서 평가 연계 표현을 명확히 확인하지 못함",
+                    "해당 월/주 수업·평가 방법 또는 수업·평가 연계란에 수행평가 활동을 명시",
                 ],
                 context=plan_text[:1800],
             )
@@ -604,23 +599,7 @@ class RuleEngine:
             return
 
         if self.doc.grade in {1, 2}:
-            if not contains_2022_curriculum(text):
-                self.add(
-                    "중",
-                    "1·2학년 2022 개정 교육과정 확인",
-                    "성취수준",
-                    ["1·2학년은 2022 개정 교육과정 기준 적용", "성취기준별 성취수준 및 학기 단위 성취수준 포함 여부 확인"],
-                    context=curriculum_context(text),
-                )
-            missing = missing_2022_achievement_level_sections(text)
-            if missing:
-                self.add(
-                    "중",
-                    "2022 개정 성취수준 항목 확인",
-                    missing[0],
-                    [f"확인 필요 항목: {', '.join(missing)}", "1·2학년 양식에는 성취기준별 성취수준과 학기 단위 성취수준 포함 여부 확인"],
-                    context=curriculum_context(text),
-                )
+            return
         elif self.doc.grade == 3:
             if not contains_2015_curriculum(text):
                 self.add(
@@ -1488,6 +1467,152 @@ def monthly_week_code_map(rows: list[list[str]]) -> dict[tuple[int, int], set[st
         elif month and week:
             result.setdefault((month, week), set()).update(codes)
     return result
+
+
+def monthly_week_text_map(rows: list[list[str]]) -> dict[tuple[int, int], str]:
+    result: dict[tuple[int, int], list[str]] = {}
+    current_month: int | None = None
+    for row in rows:
+        joined = " ".join(clean_cell(cell) for cell in row if clean_cell(cell))
+        if not joined:
+            continue
+        if "평가의 목적" in joined:
+            break
+
+        numbers: list[int] = []
+        explicit_weeks: list[int] = []
+        for cell_index, cell in enumerate(row[:4]):
+            cleaned = clean_cell(cell)
+            if re.fullmatch(r"[0-9]+", cleaned):
+                if cell_index == 0 and current_month is not None and len(row) < 7 and 1 <= int(cleaned) <= 5:
+                    explicit_weeks.append(int(cleaned))
+                    continue
+                numbers.append(int(cleaned))
+            elif re.fullmatch(r"[3-7]\s*월", cleaned):
+                numbers.append(int(cleaned[0]))
+            elif re.fullmatch(r"[1-5]\s*주", cleaned):
+                numbers.append(int(cleaned[0]))
+            else:
+                week_range = re.fullmatch(r"([1-5])\s*~\s*([1-5])", cleaned)
+                if week_range:
+                    start, end = map(int, week_range.groups())
+                    if start <= end:
+                        explicit_weeks.extend(range(start, end + 1))
+                week_single = re.fullmatch(r"([1-5])\s*주?", cleaned)
+                if week_single:
+                    explicit_weeks.append(int(week_single.group(1)))
+
+        month: int | None = None
+        week: int | None = None
+        for number in numbers:
+            if month is None and 3 <= number <= 7:
+                month = number
+                current_month = number
+            elif week is None and 1 <= number <= 5:
+                week = number
+
+        if month is None:
+            month = current_month
+            if explicit_weeks:
+                week = explicit_weeks[0]
+            else:
+                for number in numbers:
+                    if 1 <= number <= 5:
+                        week = number
+                        break
+
+        if month and explicit_weeks:
+            for explicit_week in explicit_weeks:
+                result.setdefault((month, explicit_week), []).append(joined)
+        elif month and week:
+            result.setdefault((month, week), []).append(joined)
+    return {key: "\n".join(value) for key, value in result.items()}
+
+
+def period_has_assessment_linkage(plan_text: str, period: str, rows: list[list[str]] | None = None, area_name: str = "") -> bool:
+    period_text = monthly_text_for_period(plan_text, period, rows)
+    if not period_text:
+        return True
+    if has_assessment_linkage_text(period_text, area_name):
+        return True
+    nearby_text = nearby_monthly_text_for_period(period, rows)
+    if nearby_text and has_assessment_linkage_text(nearby_text, area_name):
+        return True
+    month_text = monthly_text_for_period(plan_text, period, None)
+    if month_text and has_assessment_linkage_text(month_text, area_name):
+        return True
+    return False
+
+
+def has_assessment_linkage_text(text: str, area_name: str = "") -> bool:
+    compact = re.sub(r"\s+", "", text)
+    area_compact = normalize_area_name(area_name)
+    if area_compact and area_compact in normalize_area_name(text):
+        return True
+    keywords = (
+        "수행평가",
+        "수행평가연계",
+        "수행평가연동",
+        "수형평가",
+        "수행연계",
+        "평가",
+        "평가연계",
+        "논술",
+        "논술형평가",
+        "프로젝트",
+        "발표",
+        "구술",
+        "토의",
+        "토론",
+        "실기",
+        "실습",
+        "포트폴리오",
+        "보고서",
+        "쓰기",
+        "제작",
+        "관찰",
+        "기록",
+        "작품",
+        "활동지",
+    )
+    return any(keyword in compact for keyword in keywords)
+
+
+def nearby_monthly_text_for_period(period: str, rows: list[list[str]] | None = None) -> str:
+    if not rows:
+        return ""
+    week_keys = parse_period_weeks(period)
+    if not week_keys:
+        return ""
+    text_map = monthly_week_text_map(rows)
+    nearby_keys: list[tuple[int, int]] = []
+    for month, week in week_keys:
+        for nearby_week in (week - 1, week, week + 1):
+            if 1 <= nearby_week <= 5:
+                nearby_keys.append((month, nearby_week))
+    chunks = [text_map.get(key, "") for key in nearby_keys]
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def monthly_text_for_period(text: str, period: str, rows: list[list[str]] | None = None) -> str:
+    if "수시" in period or "중" in period:
+        return ""
+    week_keys = parse_period_weeks(period)
+    if week_keys and rows:
+        text_map = monthly_week_text_map(rows)
+        chunks = [text_map.get(key, "") for key in week_keys]
+        combined = "\n".join(chunk for chunk in chunks if chunk)
+        if combined:
+            return combined
+
+    months = [int(month) for month in re.findall(r"([3-7])\s*월", period)]
+    if not months:
+        return ""
+    plan_text = text
+    cut = plan_text.find("1. 평가의 목적")
+    if cut >= 0:
+        plan_text = plan_text[:cut]
+    return "\n".join(monthly_block(plan_text, month) for month in months)
 
 
 def split_performance_blocks(section: str) -> list[str]:
