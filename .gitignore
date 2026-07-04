@@ -72,3 +72,15 @@ tools/
 NEXT_SESSION_HANDOFF.md
 평가계획 점검기/assessment_checker_app/audit_grade3.py
 평가계획 점검기/assessment_checker_app/semester2_template_notes.json
+# Packaged desktop binaries and generated dependency folders
+*.exe
+*.msi
+*.pkg
+**/dist/
+**/build/
+**/dist_*/
+**/build_*/
+**/패키지*/
+**/패키지_*/
+**/__pycache__/
+**/node_modules/
