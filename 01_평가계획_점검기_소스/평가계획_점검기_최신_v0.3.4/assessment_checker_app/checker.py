@@ -349,7 +349,9 @@ def table_rows_for_subject_chunk(rows: list[list[str]], chunk: str) -> list[list
         distinctive = [
             re.sub(r"\s+", "", cell)
             for cell in cells
-            if len(re.sub(r"\s+", "", cell)) >= 5 and cell not in generic_labels
+            if len(re.sub(r"\s+", "", cell)) >= 5
+            and cell not in generic_labels
+            and not is_subject_split_generic_cell(cell)
         ]
         hits = sum(1 for cell in distinctive[:6] if cell and cell in compact_chunk)
         if hits >= 2 or (row_codes and row_codes <= chunk_codes and hits >= 1):
@@ -381,6 +383,19 @@ def table_rows_for_subject_chunk(rows: list[list[str]], chunk: str) -> list[list
         return matched
     # Preserve document order while filtering rows that only matched on generic labels.
     return [row for _, score, row in scored if score >= 2] or [row for _, _, row in scored]
+
+
+def is_subject_split_generic_cell(cell: str) -> bool:
+    compact = re.sub(r"\s+", "", clean_cell(cell))
+    if not compact:
+        return True
+    return bool(
+        re.search(r"평가요소중어느것도만족하지않지만유사내용을수행한경우", compact)
+        or re.search(r"채점기준을?\d+개만족하는경우", compact)
+        or re.search(r"채점기준을모두만족하는경우", compact)
+        or re.search(r"본인의의사에의한미응시", compact)
+        or re.search(r"장기미인정결석", compact)
+    )
 
 
 def find_subject_section_markers(text: str) -> list[SubjectSectionMarker]:
@@ -445,6 +460,8 @@ class RuleEngine:
         self._check_grade_curriculum_policy()
         self._check_terms()
         self._check_ratios()
+        self._check_consulting_ratio_rules()
+        self._check_consulting_overview_format()
         self._check_regular_exam_duplicate_codes()
         self._check_performance_timing_codes()
         self._check_performance_detail_timing_codes()
@@ -585,6 +602,86 @@ class RuleEngine:
                 # Look for common final total error without overfitting every sub-percent.
                 if "100%" not in ratio_section:
                     self.add("상", "반영비율 합계 확인", "합계", ["정기시험+수행평가 합계 100% 여부 확인"])
+
+    def _check_consulting_ratio_rules(self) -> None:
+        section = sector_text(self.doc, "assessment_overview", "4. 평가의 종류", "5.")
+        rows = assessment_ratio_table_rows(self.doc)
+        source_text = table_rows_text(rows) if rows else section
+        if not source_text:
+            return
+
+        regular_items = regular_exam_items_from_overview(self.doc)
+        if len(regular_items) == 1:
+            item = regular_items[0]
+            if item.ratio is not None and item.ratio > 50:
+                self.add(
+                    "상",
+                    "정기시험 1회 50% 초과",
+                    f"{item.ratio:g}%",
+                    [
+                        f"정기시험을 1회 실시하면서 반영비율이 {item.ratio:g}%로 50% 초과",
+                        "교육지원청 컨설팅 기준에 따라 정기시험 1회 실시 시 50% 이하로 조정",
+                    ],
+                    context=source_text[:1800],
+                )
+
+        essay_percent = essay_ratio_from_overview(self.doc)
+        if essay_percent is not None:
+            required = 20 if is_pe_arts_subject(self.doc.subject) else 30
+            if essay_percent < required:
+                self.add(
+                    "중",
+                    "논술형 평가 비율 확인",
+                    f"{essay_percent:g}%",
+                    [
+                        f"논술형 평가 반영비율이 {essay_percent:g}%로 컨설팅 기준({required}% 이상)보다 낮음",
+                        "체육·예술 교과는 20% 이상, 그 외 교과는 30% 이상 여부 확인",
+                    ],
+                    context=source_text[:1800],
+                )
+
+    def _check_consulting_overview_format(self) -> None:
+        section = sector_text(self.doc, "assessment_overview", "4. 평가의 종류", "5.")
+        rows = assessment_ratio_table_rows(self.doc)
+        source_text = table_rows_text(rows) if rows else section
+        if not source_text:
+            return
+
+        for context in achievement_code_range_contexts(source_text):
+            self.add(
+                "중",
+                "성취기준 코드 범위 표기",
+                "~",
+                [
+                    "성취기준 코드를 물결표(~)로 범위 표기한 부분이 있음",
+                    "컨설팅 기준에 따라 해당 성취기준 코드를 모두 개별 제시",
+                ],
+                context=context,
+            )
+
+        for item in assessment_overview_items(self.doc):
+            if item.period and not is_consulting_period_format(item.period):
+                self.add(
+                    "하",
+                    "평가시기 표기 형식 확인",
+                    item.period,
+                    [
+                        f"평가시기 '{item.period}'가 'O월 O주' 형식으로 명확히 표기되었는지 확인 필요",
+                        "컨설팅 기준에 따라 평가시기는 O월 O주까지 입력",
+                    ],
+                    context=item.context,
+                )
+            if is_vague_performance_area_name(item.name):
+                self.add(
+                    "중",
+                    "평가 영역명 구체화",
+                    item.name,
+                    [
+                        f"평가 영역명 '{item.name}'은 학습내용과 수행활동이 함께 드러나는지 확인 필요",
+                        "예: '쓰기'처럼 포괄적인 명칭보다 '주장하는 글쓰기'처럼 교과 내용+수행활동으로 작성",
+                    ],
+                    context=item.context,
+                )
 
     def _check_basic_scores(self) -> None:
         section = sector_text(self.doc, "performance_detail", "6. 수행평가", "7.")
@@ -2501,6 +2598,129 @@ def regular_exam_score_column_count(section: str, pairs: list[tuple[int, float]]
     return 1
 
 
+def regular_exam_items_from_overview(doc: Document) -> list[AssessmentOverviewItem]:
+    section = sector_text(doc, "assessment_overview", "4. 평가의 종류", "5.")
+    rows = assessment_ratio_table_rows(doc)
+    source_text = table_rows_text(rows) if rows else section
+    if "정기시험" not in source_text:
+        return []
+
+    pairs = score_ratio_pairs_from_text(source_text)
+    if not pairs:
+        pairs = score_ratio_pairs_from_rows(rows)
+    count = 0
+    compact = re.sub(r"\s+", "", source_text)
+    if "1차" in compact and "2차" in compact:
+        count = 2
+    elif "정기시험" in compact:
+        count = 1
+    result: list[AssessmentOverviewItem] = []
+    for index, (score, ratio) in enumerate(pairs[:count]):
+        result.append(
+            AssessmentOverviewItem(
+                f"{index + 1}차 정기시험" if count > 1 else "정기시험",
+                ratio,
+                score,
+                tuple(),
+                "",
+                source_text[:1800],
+                "확인 필요",
+            )
+        )
+    return result
+
+
+def score_ratio_pairs_from_rows(rows: list[list[str]]) -> list[tuple[int, float]]:
+    pairs: list[tuple[int, float]] = []
+    for cell in table_row_text_cells(rows, "영역 만점"):
+        for score, ratio in re.findall(r"(\d{1,3})\s*점\s*\(?\s*(\d+(?:\.\d+)?)\s*%\s*\)?", cell):
+            score_int = int(score)
+            ratio_float = float(ratio)
+            if score_int == 100 and ratio_float == 100:
+                continue
+            pairs.append((score_int, ratio_float))
+    if pairs:
+        return pairs
+    source_text = table_rows_text(rows)
+    return score_ratio_pairs_from_text(source_text)
+
+
+def essay_ratio_from_overview(doc: Document) -> float | None:
+    section = sector_text(doc, "assessment_overview", "4. 평가의 종류", "5.")
+    rows = assessment_ratio_table_rows(doc)
+    source_text = table_rows_text(rows) if rows else section
+    if "논술" not in source_text and "구술" not in source_text:
+        return None
+
+    cells = table_row_text_cells(rows, "논술형 평가") if rows else row_text_cells(section, "논술형 평가")
+    values: list[float] = []
+    for cell in cells:
+        values.extend(float(value) for value in PERCENT_RE.findall(cell))
+    if values:
+        values = [value for value in values if value != 100]
+        return sum(values) if values else None
+
+    for line in source_text.splitlines():
+        if "논술" not in line and "구술" not in line:
+            continue
+        values = [float(value) for value in PERCENT_RE.findall(line)]
+        if values:
+            values = [value for value in values if value != 100]
+            if values:
+                return sum(values)
+    return None
+
+
+def is_pe_arts_subject(subject: str | None) -> bool:
+    normalized = normalize_area_name(subject or "")
+    return normalized in {"체육", "음악", "미술", "예술"}
+
+
+def achievement_code_range_contexts(text: str) -> list[str]:
+    contexts: list[str] = []
+    pattern = re.compile(r"\[[0-9][^\]\s]{1,20}\]\s*[~∼-]\s*\[[0-9][^\]\s]{1,20}\]")
+    for match in pattern.finditer(text):
+        start = max(0, match.start() - 120)
+        end = min(len(text), match.end() + 120)
+        contexts.append(text[start:end])
+    return contexts
+
+
+def is_consulting_period_format(period: str) -> bool:
+    compact = re.sub(r"\s+", "", clean_cell(period))
+    if not compact:
+        return True
+    if "수시" in compact or "학기중" in compact:
+        return False
+    return bool(re.search(r"[3-7]월[1-5]주", compact))
+
+
+def is_vague_performance_area_name(name: str) -> bool:
+    compact = re.sub(r"\s+", "", clean_cell(name))
+    if compact in {
+        "쓰기",
+        "말하기",
+        "듣기",
+        "읽기",
+        "발표",
+        "보고서",
+        "논술",
+        "논술형",
+        "포트폴리오",
+        "프로젝트",
+        "탐구",
+        "실기",
+        "실습",
+        "감상",
+        "표현",
+        "실험",
+    }:
+        return True
+    if len(compact) <= 3 and re.search(r"(쓰기|발표|보고서|논술|탐구|실기|감상|표현)$", compact):
+        return True
+    return False
+
+
 def coalesce_area_name_fragments(names: list[str], target_count: int) -> list[str]:
     names = [name for name in names if is_valid_performance_area_name(name)]
     if target_count <= 0 or len(names) <= target_count:
@@ -2922,6 +3142,8 @@ def extract_basic_score_rows_from_tables(
             joined = " ".join(row)
             if not is_overall_basic_score_row(row):
                 continue
+            if is_element_level_basic_score_row(row):
+                continue
 
             numeric_cells: list[int] = []
             for cell in row:
@@ -2942,6 +3164,27 @@ def extract_basic_score_rows_from_tables(
             result.append((full_score, basic_score, context, str(basic_score)))
 
     return result
+
+
+def is_element_level_basic_score_row(row: list[str]) -> bool:
+    if not row:
+        return False
+    joined = clean_cell(" ".join(row))
+    if "기본점수" not in joined:
+        return False
+
+    first = clean_cell(row[0])
+    first_compact = re.sub(r"\s+", "", first)
+    if first_compact.startswith(("기본점수", "(기본점수)", "평가요소중어느것도")):
+        return False
+
+    if evaluation_element_score_from_row(row)[0] is not None:
+        return True
+    if re.search(r"\(\s*\d{1,3}\s*점?\s*\)", first):
+        return True
+    if row_last_score(row) is not None and re.search(r"\d{1,3}\s*\(\s*기본점수\s*\)", joined):
+        return True
+    return False
 
 
 def is_overall_basic_score_row(row: list[str]) -> bool:
