@@ -801,7 +801,7 @@ class RuleEngine:
         source_text = table_rows_text(rows) if rows else section
         if "정기시험" not in source_text or "1차" not in source_text or "2차" not in source_text:
             return
-        code_groups = table_row_code_groups(rows, "성취기준") if rows else row_code_groups(section, "성취기준")
+        code_groups = regular_exam_code_groups_from_overview(self.doc)
         if len(code_groups) < 2:
             return
         first, second = code_groups[0], code_groups[1]
@@ -2037,6 +2037,34 @@ def table_row_code_groups(rows: list[list[str]], label: str) -> list[set[str]]:
         if codes:
             groups.append(codes)
     return groups
+
+
+def regular_exam_code_groups_from_overview(doc: Document) -> list[set[str]]:
+    section = sector_text(doc, "assessment_overview", "4. 평가의 종류", "5.")
+    rows = assessment_ratio_table_rows(doc)
+    if rows:
+        source_text = table_rows_text(rows)
+        labels = table_row_text_cells(rows, "시기/영역")
+        code_groups = table_row_code_groups(rows, "성취기준")
+    else:
+        source_text = section
+        labels = row_text_cells(section, "시기/영역")
+        code_groups = row_code_groups(section, "성취기준")
+
+    compact_source = re.sub(r"\s+", "", source_text)
+    if "1차" in compact_source and "2차" in compact_source and labels and code_groups:
+        merged_groups: list[set[str]] = []
+        for exam_label in ("1차", "2차"):
+            merged: set[str] = set()
+            for label, codes in zip(labels, code_groups):
+                if exam_label in re.sub(r"\s+", "", label):
+                    merged.update(codes)
+            if merged:
+                merged_groups.append(merged)
+        if len(merged_groups) >= 2:
+            return merged_groups[:2]
+
+    return code_groups[:2]
 
 
 def clean_cell(text: str) -> str:
