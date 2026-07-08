@@ -1155,6 +1155,21 @@ class RuleEngine:
                     continue
                 topic = "엑셀형 관계검증: 수행평가 영역 매칭 확인 필요"
                 suggestion = "4번 평가표와 6번 수행평가 세부기준의 영역명을 동일하게 작성"
+            elif row.check_item == "평가요소 배점 급간":
+                if self.has_related_finding(row.key, ("배점 급간",)):
+                    continue
+                topic = "엑셀형 관계검증: 평가요소 배점 급간 불균등"
+                suggestion = "평가요소별 채점표 배점 급간을 균등하게 조정"
+            elif row.check_item == "평가요소 최하점":
+                if self.has_related_finding(row.key, ("평가요소 최하점",)):
+                    continue
+                topic = "엑셀형 관계검증: 평가요소 최하점 범위 오류"
+                suggestion = "평가요소별 최하점을 요소 만점의 20%~40% 범위로 조정"
+            elif row.check_item == "평가요소 만점-채점표 배점":
+                if self.has_related_finding(row.key, ("평가요소 만점", "채점표 배점")):
+                    continue
+                topic = "엑셀형 관계검증: 평가요소 만점-채점표 배점 불일치"
+                suggestion = "평가요소 만점과 채점표 최고 배점을 일치시켜 수정"
             else:
                 topic = f"엑셀형 관계검증: {row.check_item}"
                 suggestion = "엑셀형 관계검증 결과를 기준으로 원문 표 확인"
@@ -1314,6 +1329,83 @@ def build_excel_relation_audit(document: Document) -> list[RelationAuditRow]:
                         "6번 수행평가 성취기준이 1번 월별 계획 전체에서 확인됨"
                         if status == "Pass"
                         else f"1번 월별 계획 전체에서 확인되지 않는 수행평가 성취기준: {', '.join(missing_monthly)}"
+                    ),
+                    "상" if status == "Fail" else "하",
+                    context,
+                )
+            )
+
+    for item in extract_table_rubric_ladders(document.table_rows):
+        scores = item.get("scores", [])
+        if not isinstance(scores, list) or len(scores) < 4:
+            continue
+        score_values = [int(score) for score in scores if isinstance(score, int)]
+        if len(score_values) < 4:
+            continue
+        element_name = str(item.get("element_name") or item.get("top_anchor") or "평가요소")
+        max_score = max(score_values)
+        min_score = min(score_values)
+        element_score = item.get("element_score")
+        score_text = "-".join(str(score) for score in score_values)
+        interval_scores = comparable_interval_scores(score_values)
+        diffs = [interval_scores[index] - interval_scores[index + 1] for index in range(len(interval_scores) - 1)]
+        context = str(item.get("context", ""))
+
+        if len(interval_scores) >= 4:
+            status = "Pass" if all(diff > 0 for diff in diffs) and len(set(diffs)) == 1 else "Fail"
+            rows.append(
+                RelationAuditRow(
+                    "performance_detail",
+                    "평가요소 배점 급간",
+                    element_name,
+                    "균등 급간",
+                    f"{score_text} (감소폭: {', '.join(str(diff) for diff in diffs)})",
+                    status,
+                    (
+                        "평가요소별 채점표 배점 급간이 균등함"
+                        if status == "Pass"
+                        else f"평가요소별 채점표 배점 {score_text}의 감소폭이 균등하지 않음"
+                    ),
+                    "중" if status == "Fail" else "하",
+                    context,
+                )
+            )
+
+        if isinstance(element_score, int) and element_score > 0:
+            status = "Pass" if element_score == max_score else "Fail"
+            rows.append(
+                RelationAuditRow(
+                    "performance_detail",
+                    "평가요소 만점-채점표 배점",
+                    element_name,
+                    f"{element_score}점",
+                    f"{max_score}점",
+                    status,
+                    (
+                        "평가요소 만점과 채점표 최고 배점이 일치함"
+                        if status == "Pass"
+                        else f"평가요소 만점 {element_score}점과 채점표 최고 배점 {max_score}점이 다름"
+                    ),
+                    "상" if status == "Fail" else "하",
+                    context,
+                )
+            )
+
+        if max_score > 0:
+            percent = min_score / max_score * 100
+            status = "Pass" if 20 <= percent <= 40 else "Fail"
+            rows.append(
+                RelationAuditRow(
+                    "performance_detail",
+                    "평가요소 최하점",
+                    element_name,
+                    "20%~40%",
+                    f"{min_score}/{max_score}점 ({percent:.1f}%)",
+                    status,
+                    (
+                        "평가요소 최하점이 요소 만점의 20%~40% 범위임"
+                        if status == "Pass"
+                        else f"평가요소 최하점 {min_score}점은 요소 만점 {max_score}점 대비 {percent:.1f}%"
                     ),
                     "상" if status == "Fail" else "하",
                     context,
@@ -3141,10 +3233,13 @@ def performance_detail_blocks_from_tables(rows: list[list[str]]) -> list[dict[st
             name = row[1] if len(row) > 1 else ""
             score: int | None = None
             for index, cell in enumerate(row):
-                if "영역만점" in cell and index + 1 < len(row):
-                    match = re.search(r"\d{1,3}", row[index + 1])
-                    if match:
-                        score = int(match.group(0))
+                if "영역만점" in cell or "영역 만점" in cell:
+                    for next_cell in row[index + 1 : index + 5]:
+                        match = re.search(r"\d{1,3}", next_cell)
+                        if match:
+                            score = int(match.group(0))
+                            break
+                    if score is not None:
                         break
             if name and score is not None:
                 if current:
