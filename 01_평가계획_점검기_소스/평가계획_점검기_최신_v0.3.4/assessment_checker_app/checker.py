@@ -669,7 +669,7 @@ class RuleEngine:
                         f"평가시기 '{item.period}'가 'O월 O주' 형식으로 명확히 표기되었는지 확인 필요",
                         "컨설팅 기준에 따라 평가시기는 O월 O주까지 입력",
                     ],
-                    context=item.context,
+                    context=item.source,
                 )
             if is_vague_performance_area_name(item.name):
                 self.add(
@@ -680,7 +680,7 @@ class RuleEngine:
                         f"평가 영역명 '{item.name}'은 학습내용과 수행활동이 함께 드러나는지 확인 필요",
                         "예: '쓰기'처럼 포괄적인 명칭보다 '주장하는 글쓰기'처럼 교과 내용+수행활동으로 작성",
                     ],
-                    context=item.context,
+                    context=item.source,
                 )
 
     def _check_basic_scores(self) -> None:
@@ -2113,7 +2113,7 @@ def monthly_codes_for_period(text: str, period: str, table_rows: list[list[str]]
     if week_keys:
         months = sorted({month for month, _week in week_keys})
     else:
-        months = [int(month) for month in re.findall(r"([3-7])\s*월", period)]
+        months = [int(month) for month in re.findall(r"([3-9]|1[0-2])\s*월", period)]
     if not months:
         return set()
 
@@ -2151,7 +2151,7 @@ def monthly_block(plan_text: str, month: int) -> str:
     if not match:
         return ""
     next_matches = []
-    for next_month in range(month + 1, 8):
+    for next_month in range(month + 1, 13):
         next_match = re.search(rf"(?:^|\s|\*){next_month}\s*월(?:\s|\*|$)", plan_text[match.end():])
         if next_match:
             next_matches.append(match.end() + next_match.start())
@@ -2164,16 +2164,16 @@ def parse_period_weeks(period: str) -> list[tuple[int, int]]:
     if not compact or "수시" in compact or "중" in compact:
         return []
 
-    cross_month = re.search(r"([3-7])월([1-5])주~([3-7])월([1-5])주", compact)
+    cross_month = re.search(r"([3-9]|1[0-2])월([1-5])주~([3-9]|1[0-2])월([1-5])주", compact)
     if cross_month:
         start_month, start_week, end_month, end_week = map(int, cross_month.groups())
         return expand_week_range(start_month, start_week, end_month, end_week)
 
-    explicit_pairs = [(int(month), int(week)) for month, week in re.findall(r"([3-7])월([1-5])주", compact)]
+    explicit_pairs = [(int(month), int(week)) for month, week in re.findall(r"([3-9]|1[0-2])월([1-5])주", compact)]
     if len(explicit_pairs) > 1:
         return explicit_pairs
 
-    same_month = re.search(r"([3-7])월([1-5])(?:~([1-5]))?주", compact)
+    same_month = re.search(r"([3-9]|1[0-2])월([1-5])(?:~([1-5]))?주", compact)
     if same_month:
         month = int(same_month.group(1))
         start = int(same_month.group(2))
@@ -2214,8 +2214,8 @@ def monthly_week_code_map(rows: list[list[str]]) -> dict[tuple[int, int], set[st
                     explicit_weeks.append(int(cleaned))
                     continue
                 numbers.append(int(cleaned))
-            elif re.fullmatch(r"[3-7]\s*월", cleaned):
-                numbers.append(int(cleaned[0]))
+            elif month_match := re.fullmatch(r"([3-9]|1[0-2])\s*월", cleaned):
+                numbers.append(int(month_match.group(1)))
             elif re.fullmatch(r"[1-5]\s*주", cleaned):
                 numbers.append(int(cleaned[0]))
             else:
@@ -2231,7 +2231,7 @@ def monthly_week_code_map(rows: list[list[str]]) -> dict[tuple[int, int], set[st
         month: int | None = None
         week: int | None = None
         for number in numbers:
-            if month is None and 3 <= number <= 7:
+            if month is None and 3 <= number <= 12:
                 month = number
                 current_month = number
             elif week is None and 1 <= number <= 5:
@@ -2275,8 +2275,8 @@ def monthly_week_text_map(rows: list[list[str]]) -> dict[tuple[int, int], str]:
                     explicit_weeks.append(int(cleaned))
                     continue
                 numbers.append(int(cleaned))
-            elif re.fullmatch(r"[3-7]\s*월", cleaned):
-                numbers.append(int(cleaned[0]))
+            elif month_match := re.fullmatch(r"([3-9]|1[0-2])\s*월", cleaned):
+                numbers.append(int(month_match.group(1)))
             elif re.fullmatch(r"[1-5]\s*주", cleaned):
                 numbers.append(int(cleaned[0]))
             else:
@@ -2292,7 +2292,7 @@ def monthly_week_text_map(rows: list[list[str]]) -> dict[tuple[int, int], str]:
         month: int | None = None
         week: int | None = None
         for number in numbers:
-            if month is None and 3 <= number <= 7:
+            if month is None and 3 <= number <= 12:
                 month = number
                 current_month = number
             elif week is None and 1 <= number <= 5:
@@ -2392,7 +2392,7 @@ def monthly_text_for_period(text: str, period: str, rows: list[list[str]] | None
         if combined:
             return combined
 
-    months = [int(month) for month in re.findall(r"([3-7])\s*월", period)]
+    months = [int(month) for month in re.findall(r"([3-9]|1[0-2])\s*월", period)]
     if not months:
         return ""
     plan_text = text
@@ -2566,10 +2566,11 @@ def performance_area_names_from_ratio(doc: Document) -> list[str]:
 
 def assessment_overview_items(doc: Document) -> list[AssessmentOverviewItem]:
     section = sector_text(doc, "assessment_overview", "4. 평가의 종류", "5.")
-    items = assessment_overview_items_from_text(section)
-    if items:
-        return items
-    return assessment_overview_items_from_rows(assessment_ratio_table_rows(doc))
+    row_items = assessment_overview_items_from_rows(assessment_ratio_table_rows(doc))
+    text_items = assessment_overview_items_from_text(section)
+    if row_items and (any(item.period for item in row_items) or not text_items):
+        return row_items
+    return text_items or row_items
 
 
 def match_overview_item_by_name(name: str, overview_by_name: dict[str, AssessmentOverviewItem]) -> AssessmentOverviewItem | None:
@@ -2720,7 +2721,7 @@ def is_consulting_period_format(period: str) -> bool:
         return True
     if "수시" in compact or "학기중" in compact:
         return False
-    return bool(re.search(r"[3-7]월[1-5]주", compact))
+    return bool(re.search(r"(?:[3-9]|1[0-2])월[1-5]주", compact))
 
 
 def is_vague_performance_area_name(name: str) -> bool:
@@ -2843,7 +2844,7 @@ def periods_from_overview_text(section: str, performance_count: int | None = Non
     lines = [
         re.sub(r"\s+", " ", line).strip()
         for line in lines
-        if re.search(r"[3-7]\s*월\s*[1-5]\s*주|수시|학기\s*중", line)
+        if re.search(r"(?:[3-9]|1[0-2])\s*월\s*[1-5]\s*주|수시|학기\s*중", line)
     ]
     if not lines:
         return []
