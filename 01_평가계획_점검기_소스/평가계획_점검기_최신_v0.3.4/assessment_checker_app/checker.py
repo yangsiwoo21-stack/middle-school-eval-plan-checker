@@ -1051,13 +1051,13 @@ class RuleEngine:
                 diffs = [interval_scores[i] - interval_scores[i + 1] for i in range(len(interval_scores) - 1)]
                 if len(interval_scores) >= 4 and all(diff > 0 for diff in diffs) and len(set(diffs)) > 1:
                     score_text = "-".join(str(s) for s in interval_scores)
-                    anchor = str(item.get("score_anchor") or item.get("top_anchor") or scores[min(2, len(scores) - 1)])
+                    element_name = str(item.get("element_name") or item.get("top_anchor") or "평가요소")
                     self.add(
                         "중",
                         "배점 급간 불균등",
-                        anchor,
+                        element_name,
                         [
-                            f"{score_text}로 감소 폭 불규칙",
+                            f"{element_name}: {score_text}로 감소 폭 불규칙",
                             "배점 급간 불균등은 수정 필수: 균등 급간으로 조정",
                         ],
                         context=item["context"],
@@ -1067,10 +1067,11 @@ class RuleEngine:
                 if max_score > 0:
                     percent = min_score / max_score * 100
                     if percent < 20 or percent > 40:
+                        element_name = str(item.get("element_name") or item.get("top_anchor") or "평가요소")
                         self.add(
                             "상",
                             "평가요소 최하점 범위 오류",
-                            str(item.get("min_anchor") or min_score),
+                            element_name,
                             [
                                 f"평가요소 최하점 {min_score}점은 요소 만점 {max_score}점 대비 {percent:.1f}%",
                                 "평가요소별 최하점도 요소 만점의 20%~40% 범위로 조정",
