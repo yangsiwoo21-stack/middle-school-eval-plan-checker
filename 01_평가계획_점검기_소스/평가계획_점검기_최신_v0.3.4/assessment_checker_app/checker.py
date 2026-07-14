@@ -1478,11 +1478,12 @@ class HwpxMemoWriter:
                 if info.filename == "Contents/header.xml":
                     data = cls.ensure_memo_properties(data.decode("utf-8")).encode("utf-8")
                 elif info.filename.startswith("Contents/section") and info.filename.endswith(".xml"):
-                    section = cls.strip_existing_memos(data.decode("utf-8"))
+                    section = data.decode("utf-8")
+                    memo_base = cls.next_memo_number(section) - 1
                     for offset, finding in enumerate(findings, start=1):
                         if offset in inserted_indexes:
                             continue
-                        section, ok = cls.insert_memo_near_anchor(section, finding, offset)
+                        section, ok = cls.insert_memo_near_anchor(section, finding, memo_base + offset)
                         if ok:
                             inserted.append(finding.anchor_text)
                             inserted_indexes.add(offset)
@@ -1526,6 +1527,13 @@ class HwpxMemoWriter:
                 section,
             )
         return section
+
+    @staticmethod
+    def next_memo_number(section: str) -> int:
+        numbers = [int(number) for number in re.findall(r'<hp:integerParam name="Number">(\d+)</hp:integerParam>', section)]
+        ids = [int(memo_id) - 1430000000 for memo_id in re.findall(r'<hp:fieldBegin\b(?=[^>]*\btype="MEMO")(?=[^>]*\bid="(\d+)")', section)]
+        candidates = [number for number in numbers + ids if number > 0]
+        return max(candidates, default=0) + 1
 
     @classmethod
     def insert_memo_near_anchor(cls, section: str, finding: ReviewFinding, number: int) -> tuple[str, bool]:
