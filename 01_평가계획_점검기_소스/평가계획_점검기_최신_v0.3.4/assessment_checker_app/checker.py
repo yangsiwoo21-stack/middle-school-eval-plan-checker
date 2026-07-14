@@ -1581,15 +1581,27 @@ class HwpxMemoWriter:
         matches: list[tuple[int, int, str]] = []
         paragraph_pattern = re.compile(r"<hp:p\b[\s\S]*?</hp:p>")
         for paragraph in paragraph_pattern.finditer(section):
-            texts = re.findall(r"<hp:t(?:\s[^>]*)?>[\s\S]*?</hp:t>", paragraph.group(0))
+            paragraph_xml = paragraph.group(0)
+            texts = list(re.finditer(r"<hp:t(?:\s[^>]*)?>[\s\S]*?</hp:t>", paragraph_xml))
             if not texts:
                 continue
-            visible = "".join(html.unescape(re.sub(r"<[^>]+>", "", node)) for node in texts)
-            if compact_anchor not in re.sub(r"\s+", "", visible):
-                continue
-            node = texts[0]
-            start = paragraph.start() + paragraph.group(0).find(node)
-            matches.append((start, start + len(node), node))
+            compact_texts = [
+                re.sub(r"\s+", "", html.unescape(re.sub(r"<[^>]+>", "", node.group(0))))
+                for node in texts
+            ]
+            for first in range(len(texts)):
+                combined = ""
+                for last in range(first, len(texts)):
+                    combined += compact_texts[last]
+                    if compact_anchor in combined:
+                        start = paragraph.start() + texts[first].start()
+                        end = paragraph.start() + texts[last].end()
+                        node_span = section[start:end]
+                        if "<hp:fieldBegin" not in node_span and "<hp:fieldEnd" not in node_span:
+                            matches.append((start, end, node_span))
+                        break
+                    if len(combined) > len(compact_anchor) * 2:
+                        break
 
         if matches:
             start, end, node = max(
