@@ -254,6 +254,7 @@ class AssessmentOverviewItem:
     period: str
     source: str
     confidence: str
+    raw_score: str = ""
 
 
 @dataclass(frozen=True)
@@ -671,6 +672,19 @@ class RuleEngine:
                     ],
                     context=item.source,
                 )
+            if item.score is None:
+                raw_score = item.raw_score if hasattr(item, "raw_score") else ""
+                if raw_score and re.fullmatch(r"\d+(?:\.\d+)?\s*%", clean_cell(raw_score)):
+                    self.add(
+                        "상",
+                        "수행평가 영역 만점 표기 오류",
+                        item.name,
+                        [
+                            f"{item.name} 영역 만점이 '{raw_score}'로 표기되어 점수 확인이 어려움",
+                            "영역 만점은 '20점 (20%)'처럼 점수와 반영비율을 함께 표기",
+                        ],
+                        context=item.source,
+                    )
             if is_vague_performance_area_name(item.name):
                 self.add(
                     "중",
@@ -1520,6 +1534,9 @@ class HwpxMemoWriter:
             section, ok = cls.insert_exact_text(section, candidate, finding.memo_text, number, finding.context)
             if ok:
                 return section, True
+            section, ok = cls.insert_split_text(section, candidate, finding.memo_text, number, finding.context)
+            if ok:
+                return section, True
         return section, False
 
     @classmethod
@@ -1538,6 +1555,33 @@ class HwpxMemoWriter:
         pattern = re.compile(rf"(<hp:t[^>]*>)([^<]*{re.escape(escaped)}[^<]*)(</hp:t>)")
         for match in pattern.finditer(section):
             matches.append((match.start(), match.end(), match.group(0)))
+
+        if matches:
+            start, end, node = max(
+                matches,
+                key=lambda item: context_match_score(section, item[0], item[1], context),
+            )
+            replacement = cls.memo_begin(number, memo_text) + node + cls.memo_end(number)
+            return section[:start] + replacement + section[end:], True
+        return section, False
+
+    @classmethod
+    def insert_split_text(cls, section: str, anchor: str, memo_text: str, number: int, context: str = "") -> tuple[str, bool]:
+        compact_anchor = re.sub(r"\s+", "", html.unescape(anchor))
+        if len(compact_anchor) < 8:
+            return section, False
+        matches: list[tuple[int, int, str]] = []
+        paragraph_pattern = re.compile(r"<hp:p\b[\s\S]*?</hp:p>")
+        for paragraph in paragraph_pattern.finditer(section):
+            texts = re.findall(r"<hp:t(?:\s[^>]*)?>[\s\S]*?</hp:t>", paragraph.group(0))
+            if not texts:
+                continue
+            visible = "".join(html.unescape(re.sub(r"<[^>]+>", "", node)) for node in texts)
+            if compact_anchor not in re.sub(r"\s+", "", visible):
+                continue
+            node = texts[0]
+            start = paragraph.start() + paragraph.group(0).find(node)
+            matches.append((start, start + len(node), node))
 
         if matches:
             start, end, node = max(
@@ -2884,28 +2928,47 @@ def assessment_overview_items_from_rows(rows: list[list[str]]) -> list[Assessmen
     if not names:
         return []
     score_cells = table_row_text_cells(rows, "영역 만점")
-    pairs: list[tuple[int, float]] = []
-    for cell in score_cells:
+    raw_score_cells = score_cells[-len(names):] if len(score_cells) >= len(names) else []
+    pairs: list[tuple[int | None, float | None, str]] = []
+    for cell in raw_score_cells:
+        score: int | None = None
+        ratio: float | None = None
         match = re.search(r"(\d{1,3})\s*점\s*\(?\s*(\d+(?:\.\d+)?)\s*%\s*\)?", cell)
         if match:
-            score, ratio = match.groups()
-            pairs.append((int(score), float(ratio)))
-            continue
-        score_match = re.search(r"(\d{1,3})\s*점", cell)
-        if score_match:
-            pairs.append((int(score_match.group(1)), None))  # type: ignore[arg-type]
-    pairs = [(score, ratio) for score, ratio in pairs if score != 100 and ratio != 100]
-    pairs = pairs[-len(names):] if len(pairs) >= len(names) else []
+            score_text, ratio_text = match.groups()
+            score = int(score_text)
+            ratio = float(ratio_text)
+        else:
+            score_match = re.search(r"(\d{1,3})\s*점", cell)
+            ratio_match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*%\s*", clean_cell(cell))
+            if score_match:
+                score = int(score_match.group(1))
+            if ratio_match:
+                ratio = float(ratio_match.group(1))
+        if score != 100 and ratio != 100:
+            pairs.append((score, ratio, cell))
     periods = table_row_text_cells(rows, "평가 시기")
     codes = tuple(sorted(set(CODE_RE.findall(table_rows_text(rows)))))
     items: list[AssessmentOverviewItem] = []
     for index, name in enumerate(names):
         score: int | None = None
         ratio: float | None = None
-        if pairs:
-            score, ratio = pairs[index]
+        raw_score = ""
+        if len(pairs) == len(names):
+            score, ratio, raw_score = pairs[index]
         period = periods[-len(names) + index] if len(periods) >= len(names) else ""
-        items.append(AssessmentOverviewItem(name, ratio, score, codes, period, table_rows_text(rows[:12]), "높음" if pairs else "확인 필요"))
+        items.append(
+            AssessmentOverviewItem(
+                name,
+                ratio,
+                score,
+                codes,
+                period,
+                table_rows_text(rows[:12]),
+                "높음" if len(pairs) == len(names) else "확인 필요",
+                raw_score,
+            )
+        )
     return items
 
 
