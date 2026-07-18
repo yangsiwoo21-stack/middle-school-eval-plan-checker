@@ -10,8 +10,19 @@ import zipfile
 
 
 CODE_RE = re.compile(r"\[[0-9][^\]\s]{1,20}\]")
+LOOSE_CODE_RE = re.compile(r"\[\s*0?9[^\]]{1,30}?\s*\]")
 PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 POINT_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*점\s*\(\s*(\d+(?:\.\d+)?)\s*%\s*\)")
+
+
+def extract_achievement_codes(text: str) -> list[str]:
+    codes: list[str] = []
+    for raw in LOOSE_CODE_RE.findall(text):
+        compact = re.sub(r"\s+", "", raw)
+        if compact.startswith("[09"):
+            compact = "[9" + compact[3:]
+        codes.append(compact)
+    return codes
 
 SUBJECTS = [
     "기술가정",
@@ -28,6 +39,8 @@ SUBJECTS = [
     "영어",
     "한문",
     "정보",
+    "보건",
+    "진로와 직업",
 ]
 
 
@@ -316,7 +329,7 @@ def table_rows_for_subject_chunk(rows: list[list[str]], chunk: str) -> list[list
         return []
 
     compact_chunk = re.sub(r"\s+", "", chunk)
-    chunk_codes = set(CODE_RE.findall(chunk))
+    chunk_codes = set(extract_achievement_codes(chunk))
     generic_labels = {
         "평가영역명",
         "교육과정성취기준",
@@ -341,7 +354,7 @@ def table_rows_for_subject_chunk(rows: list[list[str]], chunk: str) -> list[list
         compact_row = re.sub(r"\s+", "", row_text)
         if not compact_row:
             continue
-        row_codes = set(CODE_RE.findall(row_text))
+        row_codes = set(extract_achievement_codes(row_text))
         if row_codes and chunk_codes and not (row_codes & chunk_codes):
             continue
         if len(compact_row) >= 12 and compact_row in compact_chunk:
@@ -367,7 +380,7 @@ def table_rows_for_subject_chunk(rows: list[list[str]], chunk: str) -> list[list
         compact_row = re.sub(r"\s+", "", row_text)
         if not compact_row:
             continue
-        row_codes = set(CODE_RE.findall(row_text))
+        row_codes = set(extract_achievement_codes(row_text))
         if row_codes and chunk_codes and not (row_codes & chunk_codes):
             continue
         score = 0
@@ -442,6 +455,8 @@ def subject_aliases() -> list[tuple[str, str]]:
         ("기술 가정과", "기술가정"),
         ("기술가정과", "기술가정"),
         ("기술과", "기술가정"),
+        ("진로와 직업과", "진로와 직업"),
+        ("진로와직업과", "진로와 직업"),
     ]
     for subject in SUBJECTS:
         if subject in {"기술가정", "기술과"}:
@@ -460,6 +475,7 @@ class RuleEngine:
         self._check_standard_sector_presence()
         self._check_grade_curriculum_policy()
         self._check_terms()
+        self._check_achievement_code_format()
         self._check_ratios()
         self._check_consulting_ratio_rules()
         self._check_consulting_overview_format()
@@ -471,7 +487,10 @@ class RuleEngine:
         self._check_performance_area_name_consistency()
         self._check_performance_linkage_presence()
         self._check_basic_scores()
+        self._check_obvious_score_inversions()
         self._check_rubric_intervals()
+        self._check_template_leftovers()
+        self._check_analysis_subject_name()
         self._check_excel_relation_engine()
         return self.findings
 
@@ -535,6 +554,57 @@ class RuleEngine:
         if "ㅐ성취기준" in text:
             self.add("중", "표기 수정", "ㅐ성취기준", ["ㅐ성취기준 → 성취기준으로 수정"])
 
+    def _check_achievement_code_format(self) -> None:
+        malformed: dict[str, str] = {}
+        for raw in LOOSE_CODE_RE.findall(reviewable_text(self.doc)):
+            compact = re.sub(r"\s+", "", raw)
+            if not compact.startswith("[09"):
+                continue
+            malformed.setdefault(compact, "[9" + compact[3:])
+        if not malformed:
+            return
+        anchor = next(iter(malformed))
+        corrections = ", ".join(f"{raw} → {fixed}" for raw, fixed in malformed.items())
+        self.add(
+            "상",
+            "성취기준 코드 표기 오류",
+            anchor,
+            [
+                f"성취기준 코드 앞자리 0 확인: {corrections}",
+                "교육과정 성취기준 코드와 동일하게 앞자리 0을 삭제",
+            ],
+            context=self.doc.around(anchor),
+        )
+
+    def _check_analysis_subject_name(self) -> None:
+        if not self.doc.subject:
+            return
+        section = sector_text(self.doc, "analysis", "10. 평가 결과", "")
+        if not section:
+            return
+        compact = re.sub(r"\s+", "", section)
+        if "가정과연계하여" not in compact or "핵심역량" not in compact:
+            return
+
+        normalized_subject = re.sub(r"[\s·ㆍ・]", "", self.doc.subject)
+        expected = f"{normalized_subject}과핵심역량"
+        normalized_section = re.sub(r"[\s·ㆍ・]", "", section)
+        if expected in normalized_section:
+            return
+
+        placeholder = re.search(r"(?:00|OO|○○|〇〇)\s*과", section, re.IGNORECASE)
+        anchor = placeholder.group(0) if placeholder else "핵심역량"
+        self.add(
+            "상",
+            "평가 결과 활용 과목명 누락",
+            anchor,
+            [
+                f"10번 평가 결과 분석 및 활용의 핵심역량 문구에 {self.doc.subject} 과목명 누락",
+                f"'{self.doc.subject}과 핵심역량'으로 수정",
+            ],
+            context=self.doc.around(anchor),
+        )
+
     def _check_ratios(self) -> None:
         ratio_section = sector_text(self.doc, "assessment_overview", "4. 평가의 종류", "5.")
         ratio_source = ratio_section or self.doc.text
@@ -566,24 +636,6 @@ class RuleEngine:
                     ],
                     context=ratio_source[:1800],
                 )
-        detail_section = sector_text(self.doc, "performance_detail", "6. 수행평가", "7.")
-        for area_name, score, context in extract_performance_text_detail_items(detail_section):
-            if score <= 30:
-                continue
-            anchor = f"{area_name} {score:g}점"
-            if anchor in seen_ratio_anchors:
-                continue
-            seen_ratio_anchors.add(anchor)
-            self.add(
-                "상",
-                "수행평가 한 영역 30% 초과",
-                f"{score:g}점",
-                [
-                    f"6번 수행평가 세부기준에서 '{area_name}' 영역만점이 {score:g}점으로 30점 초과",
-                    "한 수행평가 영역이 30%를 넘지 않도록 영역 분리 또는 반영비율 조정",
-                ],
-                context=context,
-            )
         if not overview_items:
             for point, percent in POINT_PERCENT_RE.findall(ratio_source):
                 p = float(percent)
@@ -733,6 +785,18 @@ class RuleEngine:
                 if expected is None:
                     continue
                 detail_score = block["score"]
+                if not detail_score:
+                    self.add(
+                        "상",
+                        "수행평가 영역 만점 누락",
+                        str(block["name"]),
+                        [
+                            f"4번 평가 종류 표의 '{block['name']}' 영역 만점은 {expected}점이나, 6번 수행평가 세부기준의 영역 만점이 비어 있음",
+                            "6번 수행평가 세부기준에 영역 만점을 입력",
+                        ],
+                        context=table_rows_text(block["rows"][:4]),
+                    )
+                    continue
                 if detail_score != expected:
                     self.add(
                         "상",
@@ -837,20 +901,15 @@ class RuleEngine:
         if not section and not rows:
             return
         source_text = table_rows_text(rows) if rows else section
-        time_cells = table_row_text_cells(rows, "평가 시기") if rows else row_text_cells(section, "평가 시기")
-        code_groups = table_row_code_groups(rows, "성취기준") if rows else row_code_groups(section, "성취기준")
-        if not time_cells or not code_groups:
+        overview_items = assessment_overview_items(self.doc)
+        if not overview_items:
             return
-
-        mixed = "정기시험" in source_text and "수행평가" in source_text
-        skip = 0
-        if mixed:
-            if "1차" in source_text and "2차" in source_text and len(time_cells) >= 4 and len(code_groups) >= 4:
-                skip = 2
-            elif len(time_cells) >= 3 and len(code_groups) >= 3:
-                skip = 1
-        for time_text, codes in zip(time_cells[skip:], code_groups[skip:]):
+        for item in overview_items:
+            time_text = item.period
+            codes = set(item.achievement_codes)
             if not codes or "수시" in time_text:
+                continue
+            if not is_consulting_period_format(time_text):
                 continue
             plan_text = sector_text(self.doc, "monthly_plan") or self.doc.text
             planned_codes = learned_codes_before_or_by_period(plan_text, time_text, self.doc.table_rows)
@@ -860,11 +919,12 @@ class RuleEngine:
             if missing:
                 self.add(
                     "상",
-                    "평가시기-수행 성취기준 불일치",
+                    "평가시기-성취기준 불일치",
                     time_text,
                     [
-                        f"평가시기 {time_text} 월별 운영계획에 없는 성취기준: {', '.join(missing)}",
-                        "평가시기 또는 수행평가 성취기준 수정",
+                        f"평가시기: {time_text}",
+                        *achievement_first_appearance_lines(missing, self.doc.table_rows),
+                        "평가시기 또는 성취기준 수정",
                     ],
                     context=source_text[:1800],
                 )
@@ -877,8 +937,8 @@ class RuleEngine:
         if not plan_text:
             return
 
-        detail_items = extract_performance_text_detail_items(detail_section)
-        if not detail_items and self.doc.table_rows:
+        detail_items: list[tuple[str, int, str]] = []
+        if self.doc.table_rows:
             detail_items = [
                 (
                     str(block.get("name", "")),
@@ -888,6 +948,8 @@ class RuleEngine:
                 for block in performance_detail_blocks_from_tables(self.doc.table_rows)
             ]
         if not detail_items:
+            detail_items = extract_performance_text_detail_items(detail_section)
+        if not detail_items:
             return
 
         overview_by_name = {
@@ -895,28 +957,41 @@ class RuleEngine:
             for item in assessment_overview_items(self.doc)
             if normalize_area_name(item.name)
         }
-        all_monthly_codes = set(CODE_RE.findall(plan_text))
+        all_monthly_codes = set(extract_achievement_codes(plan_text))
         reported_missing_from_plan: set[tuple[str, tuple[str, ...]]] = set()
         reported_uncertain_period: set[str] = set()
         for name, _score, context in detail_items:
-            codes = set(CODE_RE.findall(context))
+            codes = set(extract_achievement_codes(context))
             if not codes:
                 continue
 
             matched_item = match_overview_item_by_name(name, overview_by_name)
             period = matched_item.period if matched_item else ""
             if period:
+                if "수시" in period or "학기 중" in period:
+                    continue
+                if not is_consulting_period_format(period):
+                    continue
                 planned_codes = learned_codes_before_or_by_period(plan_text, period, self.doc.table_rows)
                 if planned_codes:
                     missing = sorted(codes - planned_codes)
                     if missing:
+                        duplicate = any(
+                            "평가시기-성취기준 불일치" in finding.topic
+                            and period in finding.memo_text
+                            and all(code in finding.memo_text for code in missing)
+                            for finding in self.findings
+                        )
+                        if duplicate:
+                            continue
                         self.add(
                             "상",
-                            "평가시기-수행평가 세부기준 성취기준 불일치",
+                            "평가시기-성취기준 불일치",
                             name,
                             [
-                                f"6번 수행평가 '{name}'의 성취기준 {', '.join(missing)}이 평가시기({period}) 이전 또는 해당 주차의 월별 교수학습 운영계획에서 확인되지 않음",
-                                "1번 월별 교수학습 운영계획의 성취기준 또는 4번 평가시기/6번 수행평가 성취기준 수정",
+                                f"평가시기: {period}",
+                                *achievement_first_appearance_lines(missing, self.doc.table_rows),
+                                "월별 계획, 평가시기 또는 성취기준 수정",
                             ],
                             context=context[:1800],
                         )
@@ -933,18 +1008,8 @@ class RuleEngine:
                         ],
                         context=context[:1800],
                     )
-            elif name not in reported_uncertain_period:
-                reported_uncertain_period.add(name)
-                self.add(
-                    "중",
-                    "수행평가 평가시기 확인 필요",
-                    name,
-                    [
-                        f"6번 수행평가 '{name}'과 일치하는 4번 평가표의 평가시기를 안정적으로 찾지 못함",
-                        "4번 평가의 종류와 반영비율 표의 영역명과 평가시기, 6번 수행평가 영역명을 일치시켜 확인",
-                    ],
-                    context=context[:1800],
-                )
+            # 영역명이 일치하지 않는 경우는 영역명 비교 규칙에서 한 번만 안내한다.
+            # 4번 표가 없거나 파싱되지 않은 특수 과목도 평가시기 오류로 단정하지 않는다.
 
             if all_monthly_codes:
                 missing_from_plan = sorted(codes - all_monthly_codes)
@@ -966,6 +1031,28 @@ class RuleEngine:
         if not self.doc.subject:
             return
         text = sector_text(self.doc, "achievement_level", "3. 성취기준", "4.") or self.doc.text
+        if self.policy.require_2022_achievement_levels:
+            codes = set(extract_achievement_codes(text))
+            placeholder_only = "붙여넣기" in text or not codes
+            semester_part = text[text.find("학기 단위 성취수준") :] if "학기 단위 성취수준" in text else ""
+            has_semester_levels = bool(
+                len(semester_part) >= 180
+                and re.search(r"(?:^|\n)\s*(?:A|P)\s*(?:\n|$)", semester_part)
+            )
+            if placeholder_only or not has_semester_levels:
+                missing = []
+                if placeholder_only:
+                    missing.append("성취기준별 성취수준 표 미작성")
+                if not has_semester_levels:
+                    missing.append("학기 단위 성취수준 표 미작성")
+                self.add(
+                    "상",
+                    "성취기준·성취수준 미작성",
+                    "성취기준별 성취수준",
+                    [*missing, "2022 개정 교육과정 자료 반영"],
+                    context=text[:1200],
+                )
+                return
         arts = {"체육", "음악", "미술"}
         if self.doc.subject in arts:
             if re.search(r"\bD\b|\bE\b", text):
@@ -1013,8 +1100,8 @@ class RuleEngine:
             criteria_part = section_between(block, "평가 기준", "평가 요소") or section_between(block, "평가기준", "평가요소")
             if not edu_part or not criteria_part:
                 continue
-            edu_codes = set(CODE_RE.findall(edu_part))
-            criteria_codes = set(CODE_RE.findall(criteria_part))
+            edu_codes = set(extract_achievement_codes(edu_part))
+            criteria_codes = set(extract_achievement_codes(criteria_part))
             extra = sorted(criteria_codes - edu_codes)
             if extra:
                 anchor = extra[0]
@@ -1141,9 +1228,76 @@ class RuleEngine:
                         context=block[:1600],
                     )
 
+    def _check_obvious_score_inversions(self) -> None:
+        for item in extract_table_score_inversions(self.doc.table_rows):
+            previous = int(item["previous_score"])
+            score = int(item["score"])
+            anchor = str(item["anchor"])
+            self.add(
+                "상",
+                "배점 오기입",
+                anchor,
+                [
+                    f"같은 평가요소의 배점이 {previous}점 다음 {score}점으로 역전됨",
+                    "숫자 오기입 여부를 확인하여 배점 순서를 수정",
+                ],
+                context=str(item["context"]),
+            )
+
+    def _check_template_leftovers(self) -> None:
+        text = self.doc.text
+        purpose_guide = "참고용, 해당 글상자 및 예시 삭제 후 제출하기"
+        rubric_guide = "각 영역별 수행평가의 수행 수준(채점기준)은 해당 과목의 교육과정 성취기준에 근거하여 구체적으로 제시"
+        rate_guide = "해당 교과에 맞는 성취율과 성취도를 제시"
+        arts_rate = "체육·예술(음악·미술) 교과의 과목 성취도"
+
+        if purpose_guide in text:
+            self.add(
+                "중",
+                "기본 양식 안내문 삭제",
+                purpose_guide,
+                [
+                    "참고용 유의사항과 예시 글상자가 남아 있음",
+                    "실제 작성 내용이 아니므로 삭제",
+                ],
+            )
+
+        if rubric_guide in text:
+            self.add(
+                "중",
+                "기본 양식 안내문 삭제",
+                rubric_guide,
+                [
+                    "수행평가 작성용 유의사항이 남아 있음",
+                    "실제 평가 내용이 아니므로 유의사항 글상자 삭제",
+                ],
+            )
+
+        arts_subjects = {"체육", "음악", "미술"}
+        if arts_rate in text and self.doc.subject not in arts_subjects:
+            self.add(
+                "중",
+                "불필요한 성취율 표 삭제",
+                arts_rate,
+                [
+                    "일반교과는 A~E 성취도 표 적용",
+                    "체육·예술용 A~C 표와 선택 안내문 삭제",
+                ],
+            )
+        elif rate_guide in text:
+            self.add(
+                "중",
+                "기본 양식 안내문 삭제",
+                rate_guide,
+                [
+                    "교과 성취도 표 선택이 완료된 뒤에도 안내문이 남아 있음",
+                    "'<유의사항>·아래 표 중 택1' 안내문 삭제",
+                ],
+            )
+
     def _check_excel_relation_engine(self) -> None:
         for row in build_excel_relation_audit(self.doc):
-            if row.status == "Pass":
+            if row.status in {"Pass", "확인 필요"}:
                 continue
             if row.check_item == "4번-6번 영역만점":
                 if self.has_related_finding(row.key, ("영역 만점", "만점 불일치")):
@@ -1153,7 +1307,7 @@ class RuleEngine:
             elif row.check_item == "4번-6번 성취기준":
                 if self.has_related_finding(row.key, ("성취기준",)):
                     continue
-                topic = "엑셀형 관계검증: 4번-6번 성취기준 불일치"
+                topic = "4번-6번 수행평가 성취기준 불일치"
                 suggestion = "4번 평가표와 6번 수행평가 세부기준의 성취기준을 같은 평가영역 기준으로 일치시켜 수정"
             elif row.check_item == "6번-1번 성취기준 전체":
                 if self.has_related_finding(row.key, ("성취기준", "월별 계획표")):
@@ -1206,7 +1360,7 @@ def build_excel_relation_audit(document: Document) -> list[RelationAuditRow]:
     """Create spreadsheet-style relationship checks between the three core tables."""
     rows: list[RelationAuditRow] = []
     plan_text = sector_text(document, "monthly_plan") or monthly_plan_text(document.text)
-    monthly_codes = set(CODE_RE.findall(plan_text))
+    monthly_codes = set(extract_achievement_codes(plan_text))
     overview_items = assessment_overview_items(document)
     detail_items = performance_detail_relation_items(document)
     overview_by_name = {normalize_area_name(item.name): item for item in overview_items if normalize_area_name(item.name)}
@@ -1439,7 +1593,7 @@ def performance_detail_relation_items(document: Document) -> list[dict[str, obje
                 {
                     "name": str(block.get("name", "")),
                     "score": int(block.get("score", 0) or 0),
-                    "codes": set(CODE_RE.findall(context)),
+                    "codes": set(extract_achievement_codes(context)),
                     "context": context,
                 }
             )
@@ -1448,7 +1602,7 @@ def performance_detail_relation_items(document: Document) -> list[dict[str, obje
 
     section = sector_text(document, "performance_detail", "6. 수행평가", "7.")
     return [
-        {"name": name, "score": score, "codes": set(CODE_RE.findall(context)), "context": context}
+        {"name": name, "score": score, "codes": set(extract_achievement_codes(context)), "context": context}
         for name, score, context in extract_performance_text_detail_items(section)
     ]
 
@@ -1478,7 +1632,7 @@ class HwpxMemoWriter:
                 if info.filename == "Contents/header.xml":
                     data = cls.ensure_memo_properties(data.decode("utf-8")).encode("utf-8")
                 elif info.filename.startswith("Contents/section") and info.filename.endswith(".xml"):
-                    section = data.decode("utf-8")
+                    section = cls.strip_existing_memos(data.decode("utf-8"))
                     memo_base = cls.next_memo_number(section) - 1
                     for offset, finding in enumerate(findings, start=1):
                         if offset in inserted_indexes:
@@ -1691,7 +1845,7 @@ def context_match_score(section: str, start: int, end: int, context: str) -> int
 def context_tokens(text: str) -> list[str]:
     cleaned = clean_cell(text)
     tokens: list[str] = []
-    tokens.extend(CODE_RE.findall(cleaned))
+    tokens.extend(extract_achievement_codes(cleaned))
     tokens.extend(re.findall(r"\d+월\s*\d+(?:~\d+)?주", cleaned))
     tokens.extend(re.findall(r"\d+(?:\.\d+)?점\s*\(\s*\d+(?:\.\d+)?%\s*\)", cleaned))
     tokens.extend(re.findall(r"[0-9A-Za-z가-힣·․~()]{4,}", cleaned))
@@ -2121,7 +2275,7 @@ def row_code_groups(section: str, label: str) -> list[set[str]]:
     cells = row_text_cells(section, label)
     groups = []
     for cell in cells:
-        codes = set(CODE_RE.findall(cell))
+        codes = set(extract_achievement_codes(cell))
         if codes:
             groups.append(codes)
     return groups
@@ -2190,7 +2344,7 @@ def table_row_text_cells(rows: list[list[str]], label: str) -> list[str]:
 def table_row_code_groups(rows: list[list[str]], label: str) -> list[set[str]]:
     groups = []
     for cell in table_row_text_cells(rows, label):
-        codes = set(CODE_RE.findall(cell))
+        codes = set(extract_achievement_codes(cell))
         if codes:
             groups.append(codes)
     return groups
@@ -2282,7 +2436,7 @@ def monthly_codes_for_period(text: str, period: str, table_rows: list[list[str]]
     codes: set[str] = set()
     for month in months:
         month_block = monthly_block(plan_text, month)
-        codes.update(CODE_RE.findall(month_block))
+        codes.update(extract_achievement_codes(month_block))
     return codes
 
 
@@ -2300,6 +2454,16 @@ def learned_codes_before_or_by_period(text: str, period: str, table_rows: list[l
                     codes.update(key_codes)
             return codes
     return monthly_codes_for_period(text, period, table_rows)
+
+
+def achievement_first_appearance_lines(codes: list[str], table_rows: list[list[str]] | None) -> list[str]:
+    week_map = monthly_week_code_map(table_rows or [])
+    lines: list[str] = []
+    for code in codes:
+        weeks = sorted(key for key, values in week_map.items() if code in values)
+        first = f"{weeks[0][0]}월 {weeks[0][1]}주" if weeks else "월별 계획에 없음"
+        lines.append(f"{code} 최초 등장: {first}")
+    return lines
 
 
 def monthly_block(plan_text: str, month: int) -> str:
@@ -2359,7 +2523,7 @@ def monthly_week_code_map(rows: list[list[str]]) -> dict[tuple[int, int], set[st
         joined = " ".join(row)
         if "평가의 목적" in joined:
             break
-        if not CODE_RE.search(joined):
+        if not extract_achievement_codes(joined):
             continue
 
         numbers: list[int] = []
@@ -2376,7 +2540,7 @@ def monthly_week_code_map(rows: list[list[str]]) -> dict[tuple[int, int], set[st
             elif re.fullmatch(r"[1-5]\s*주", cleaned):
                 numbers.append(int(cleaned[0]))
             else:
-                week_range = re.fullmatch(r"([1-5])\s*~\s*([1-5])", cleaned)
+                week_range = re.fullmatch(r"([1-5])\s*[-~∼～]\s*([1-5])", cleaned)
                 if week_range:
                     start, end = map(int, week_range.groups())
                     if start <= end:
@@ -2404,7 +2568,7 @@ def monthly_week_code_map(rows: list[list[str]]) -> dict[tuple[int, int], set[st
                         week = number
                         break
 
-        codes = set(CODE_RE.findall(joined))
+        codes = set(extract_achievement_codes(joined))
         if month and explicit_weeks:
             for explicit_week in explicit_weeks:
                 result.setdefault((month, explicit_week), set()).update(codes)
@@ -2437,7 +2601,7 @@ def monthly_week_text_map(rows: list[list[str]]) -> dict[tuple[int, int], str]:
             elif re.fullmatch(r"[1-5]\s*주", cleaned):
                 numbers.append(int(cleaned[0]))
             else:
-                week_range = re.fullmatch(r"([1-5])\s*~\s*([1-5])", cleaned)
+                week_range = re.fullmatch(r"([1-5])\s*[-~∼～]\s*([1-5])", cleaned)
                 if week_range:
                     start, end = map(int, week_range.groups())
                     if start <= end:
@@ -2711,7 +2875,8 @@ def performance_area_names_from_ratio(doc: Document) -> list[str]:
         return [
             item.name
             for item in items
-            if (item.score is not None or item.ratio is not None) and is_valid_performance_area_name(item.name)
+            if (item.score is not None or item.ratio is not None)
+            and is_valid_performance_area_name(item.name)
         ]
     rows = assessment_ratio_table_rows(doc)
     names = performance_area_names_from_ratio_rows(rows)
@@ -2761,7 +2926,7 @@ def assessment_overview_items_from_text(section: str) -> list[AssessmentOverview
     if pairs:
         names = coalesce_area_name_fragments(names, len(pairs))
     periods = periods_from_overview_text(section, len(names))
-    codes = tuple(sorted(set(CODE_RE.findall(section))))
+    codes = tuple(sorted(set(extract_achievement_codes(section))))
     paired = pairs[-len(names):] if len(pairs) >= len(names) else []
     items: list[AssessmentOverviewItem] = []
     for index, name in enumerate(names):
@@ -2877,8 +3042,12 @@ def is_consulting_period_format(period: str) -> bool:
     if not compact:
         return True
     if "수시" in compact or "학기중" in compact:
-        return False
-    return bool(re.search(r"(?:[3-9]|1[0-2])월[1-5]주", compact))
+        return True
+    single = r"(?:[3-9]|1[0-2])월[1-5]주"
+    same_month_range = r"(?:[3-9]|1[0-2])월[1-5](?:주)?[~∼-][1-5]주"
+    cross_month_range = rf"{single}[~∼-]{single}"
+    unit = rf"(?:{single}|{same_month_range}|{cross_month_range})"
+    return bool(re.fullmatch(rf"{unit}(?:,{unit})*", compact))
 
 
 def is_vague_performance_area_name(name: str) -> bool:
@@ -2948,9 +3117,8 @@ def assessment_overview_items_from_rows(rows: list[list[str]]) -> list[Assessmen
     if not names:
         return []
     score_cells = table_row_text_cells(rows, "영역 만점")
-    raw_score_cells = score_cells[-len(names):] if len(score_cells) >= len(names) else []
     pairs: list[tuple[int | None, float | None, str]] = []
-    for cell in raw_score_cells:
+    for cell in score_cells:
         score: int | None = None
         ratio: float | None = None
         match = re.search(r"(\d{1,3})\s*점\s*\(?\s*(\d+(?:\.\d+)?)\s*%\s*\)?", cell)
@@ -2967,8 +3135,15 @@ def assessment_overview_items_from_rows(rows: list[list[str]]) -> list[Assessmen
                 ratio = float(ratio_match.group(1))
         if score != 100 and ratio != 100:
             pairs.append((score, ratio, cell))
+    if len(pairs) >= len(names):
+        pairs = pairs[-len(names):]
     periods = table_row_text_cells(rows, "평가 시기")
-    codes = tuple(sorted(set(CODE_RE.findall(table_rows_text(rows)))))
+    code_groups = table_row_code_groups(rows, "성취기준")
+    if len(code_groups) >= len(names):
+        code_groups = code_groups[-len(names):]
+    else:
+        code_groups = []
+    fallback_codes = tuple(sorted(set(extract_achievement_codes(table_rows_text(rows)))))
     items: list[AssessmentOverviewItem] = []
     for index, name in enumerate(names):
         score: int | None = None
@@ -2977,6 +3152,7 @@ def assessment_overview_items_from_rows(rows: list[list[str]]) -> list[Assessmen
         if len(pairs) == len(names):
             score, ratio, raw_score = pairs[index]
         period = periods[-len(names) + index] if len(periods) >= len(names) else ""
+        codes = tuple(sorted(code_groups[index])) if code_groups else fallback_codes
         items.append(
             AssessmentOverviewItem(
                 name,
@@ -3015,8 +3191,14 @@ def periods_from_overview_text(section: str, performance_count: int | None = Non
     if start < 0:
         return []
     segment = section[start:]
-    lines = [clean_cell(line) for line in segment.splitlines()]
-    lines = [line for line in lines if line and line != "평가 시기"]
+    raw_lines = [clean_cell(line) for line in segment.splitlines()]
+    raw_lines = [line for line in raw_lines if line and line != "평가 시기"]
+    lines: list[str] = []
+    for line in raw_lines:
+        if lines and re.fullmatch(r"[1-5]\s*주", line) and re.search(r"[~∼-]\s*(?:[3-9]|1[0-2])\s*월$", lines[-1]):
+            lines[-1] = f"{lines[-1]} {line}"
+        else:
+            lines.append(line)
     lines = [
         re.sub(r"\s+", " ", line).strip()
         for line in lines
@@ -3048,7 +3230,26 @@ def periods_from_overview_text(section: str, performance_count: int | None = Non
 
 
 def performance_area_names_from_ratio_rows(rows: list[list[str]]) -> list[str]:
-    names = table_row_text_cells(rows, "시기/영역") or table_row_text_cells(rows, "영역")
+    candidate_name_rows: list[list[str]] = []
+    for row in rows:
+        compact_cells = [re.sub(r"\s+", "", clean_cell(cell)) for cell in row]
+        label_index = next((i for i, cell in enumerate(compact_cells) if "시기/영역" in cell), None)
+        if label_index is None:
+            continue
+        candidate_name_rows.append([clean_cell(cell) for cell in row[label_index + 1 :] if clean_cell(cell)])
+    names: list[str] = []
+    if candidate_name_rows:
+        # Some templates use two "시기/영역" rows: dates first, actual area
+        # names second. Prefer the row containing fewer date-like cells.
+        names = max(
+            candidate_name_rows,
+            key=lambda cells: (
+                sum(1 for cell in cells if not parse_period_weeks(cell) and "수시" not in cell),
+                -sum(1 for cell in cells if parse_period_weeks(cell) or "수시" in cell),
+            ),
+        )
+    if not names:
+        names = table_row_text_cells(rows, "영역")
     if not names:
         return []
     source_text = table_rows_text(rows)
@@ -3109,6 +3310,8 @@ def is_assessment_type_cell(value: str) -> bool:
 def is_valid_performance_area_name(value: str) -> bool:
     cleaned = clean_cell(value)
     compact = re.sub(r"\s+", "", cleaned)
+    if "정기시험" in compact:
+        return False
     if not compact or len(compact) < 2:
         return False
     invalid_exact = {
@@ -3145,7 +3348,7 @@ def is_valid_performance_area_name(value: str) -> bool:
         return False
     if re.fullmatch(r"[12]차\(?\d+(?:\.\d+)?%\)?", compact):
         return False
-    if CODE_RE.search(cleaned):
+    if extract_achievement_codes(cleaned):
         return False
     return True
 
@@ -3306,29 +3509,44 @@ def performance_detail_blocks_from_tables(rows: list[list[str]]) -> list[dict[st
     current: dict[str, object] | None = None
     for row in rows:
         joined = " ".join(row)
-        if row and "평가영역명" in row[0]:
+        if row and "평가 요소" in clean_cell(row[0]) and any("관련 성취기준" in clean_cell(cell) for cell in row):
+            if current:
+                blocks.append(current)
+            break
+
+        first_cell = re.sub(r"\s+", "", clean_cell(row[0])) if row else ""
+        if first_cell == "평가영역명":
             match = re.search(r"(.+?)\((\d{1,3})\s*점\)", joined)
             if match:
                 if current:
                     blocks.append(current)
                 current = {"name": match.group(1).replace("평가영역명", "").strip(), "score": int(match.group(2)), "rows": [row]}
                 continue
-        if row and "평가 영역명" in row[0]:
-            name = row[1] if len(row) > 1 else ""
+
+            name = ""
+            ignored = {"평가영역명", "영역만점", "학기", "1학기", "2학기"}
+            for cell in row[1:]:
+                cleaned = clean_cell(cell)
+                compacted = re.sub(r"\s+", "", cleaned)
+                if not cleaned or compacted in ignored or re.fullmatch(r"\d{1,3}(?:점)?", compacted):
+                    continue
+                name = cleaned
+                break
             score: int | None = None
             for index, cell in enumerate(row):
                 if "영역만점" in cell or "영역 만점" in cell:
                     for next_cell in row[index + 1 : index + 5]:
-                        match = re.search(r"\d{1,3}", next_cell)
+                        cleaned = clean_cell(next_cell)
+                        match = re.fullmatch(r"(\d{1,3})(?:\s*점)?", cleaned)
                         if match:
-                            score = int(match.group(0))
+                            score = int(match.group(1))
                             break
                     if score is not None:
                         break
-            if name and score is not None:
+            if name:
                 if current:
                     blocks.append(current)
-                current = {"name": name, "score": score, "rows": [row]}
+                current = {"name": name, "score": score or 0, "rows": [row]}
                 continue
         if current:
             current["rows"].append(row)  # type: ignore[index]
@@ -3499,6 +3717,69 @@ def row_last_score(row: list[str]) -> int | None:
     return None
 
 
+def extract_table_score_inversions(rows: list[list[str]]) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    seen: set[tuple[str, int, int, str]] = set()
+    for block in performance_detail_blocks_from_tables(rows):
+        block_rows = block["rows"]  # type: ignore[assignment]
+        in_score_table = False
+        current_element = ""
+        top_score: int | None = None
+        previous_score: int | None = None
+        previous_row: list[str] = []
+        for row in block_rows:
+            joined = clean_cell(" ".join(row))
+            compact_joined = re.sub(r"\s+", "", joined)
+            if "평가요소" in compact_joined and "배점" in compact_joined:
+                in_score_table = True
+                current_element = ""
+                top_score = None
+                previous_score = None
+                previous_row = []
+                continue
+            if not in_score_table:
+                continue
+            if (
+                "기본점수" in compact_joined
+                or "본인의의사" in compact_joined
+                or "학업성적관리규정" in compact_joined
+                or "백지제출" in compact_joined
+            ):
+                current_element = ""
+                top_score = None
+                previous_score = None
+                previous_row = []
+                continue
+
+            score = row_last_score(row)
+            element = clean_cell(row[0]) if row else ""
+            if score is None or not element:
+                continue
+            if element != current_element:
+                current_element = element
+                top_score = score
+                previous_score = score
+                previous_row = row
+                continue
+            if previous_score is not None and top_score is not None and score > top_score:
+                anchor = rubric_row_anchor(row)
+                key = (element, previous_score, score, anchor)
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(
+                        {
+                            "element": element,
+                            "previous_score": previous_score,
+                            "score": score,
+                            "anchor": anchor,
+                            "context": table_rows_text([previous_row, row]),
+                        }
+                    )
+            previous_score = score
+            previous_row = row
+    return findings
+
+
 def evaluation_element_score_from_row(row: list[str]) -> tuple[int | None, str]:
     if not row:
         return None, ""
@@ -3550,7 +3831,7 @@ def extract_text_element_score_mismatches(section: str) -> list[tuple[str, int, 
             return False
         if "%" in compact_name or re.fullmatch(r"\(?\d{1,3}\s*(?:점|%)?\)?", compact_name):
             return False
-        if len(CODE_RE.findall(name)) > 0:
+        if len(extract_achievement_codes(name)) > 0:
             return False
         return re.fullmatch(r"\(?\s*\d{1,3}\s*점\s*\)?", lines[index + 1]) is not None
 
@@ -3623,9 +3904,10 @@ def extract_text_element_score_mismatches(section: str) -> list[tuple[str, int, 
 def comparable_interval_scores(scores: list[int]) -> list[int]:
     if len(scores) < 2:
         return scores
-    collapsed = scores[:]
-    while len(collapsed) >= 2 and collapsed[-1] == collapsed[-2]:
-        collapsed.pop()
+    collapsed = [scores[0]]
+    for score in scores[1:]:
+        if score != collapsed[-1]:
+            collapsed.append(score)
     if len(collapsed) != len(set(collapsed)):
         return []
     return collapsed
@@ -3660,7 +3942,7 @@ def anchor_candidates(finding: ReviewFinding) -> list[str]:
     is_timing_finding = "평가시기" in finding.topic or "평가시기" in finding.memo_text
     is_score_interval_finding = "배점 급간" in finding.topic
     if not is_timing_finding:
-        codes = CODE_RE.findall(finding.memo_text)
+        codes = extract_achievement_codes(finding.memo_text)
         anchors.extend(codes)
     if is_timing_finding:
         anchors.extend(re.findall(r"\d+월\s*\d+(?:~\d+)?주", finding.context))
