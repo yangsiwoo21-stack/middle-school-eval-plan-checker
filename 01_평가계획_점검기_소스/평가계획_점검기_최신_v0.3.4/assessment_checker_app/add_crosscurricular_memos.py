@@ -8,7 +8,13 @@ import shutil
 import tempfile
 import zipfile
 
-from checker import Document, HwpxMemoWriter, ReviewFinding, extract_visible_text
+from checker import (
+    Document,
+    HwpxMemoWriter,
+    ReviewFinding,
+    extract_visible_text,
+    validate_hwpx_with_hancom,
+)
 
 
 SUBJECT_ALIASES = {
@@ -116,7 +122,7 @@ def recorded_hours(topic: str, text: str) -> int:
         needle = compact(alias)
         for occurrence in re.finditer(re.escape(needle), haystack):
             nearby = haystack[occurrence.end() : occurrence.end() + 40]
-            hour_match = re.search(r"(\d+)시간", nearby)
+            hour_match = re.search(r"(\d+)(?:시간|차시)", nearby)
             if hour_match:
                 matches.append((occurrence.start(), int(hour_match.group(1))))
 
@@ -189,6 +195,9 @@ def add_memo_preserving_existing(path: Path, finding: ReviewFinding) -> bool:
             bad = check.testzip()
             if bad:
                 raise RuntimeError(f"손상된 HWPX 항목: {bad}")
+        openable, message = validate_hwpx_with_hancom(temp_path)
+        if not openable:
+            raise RuntimeError(f"한글 열기 검사 실패: {message}")
         temp_path.replace(path)
     finally:
         temp_path.unlink(missing_ok=True)

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 import html
 import json
@@ -171,6 +172,22 @@ class ReviewRunner:
             except PermissionError:
                 dst = next_available_path(out_dir / f"{src.stem}_메모첨부_새로생성{src.suffix}")
                 result = HwpxMemoWriter.copy_with_memos(src, dst, file_findings)
+            openable, validation_message = validate_hwpx_with_hancom(dst)
+            result["hancom_open_test"] = validation_message
+            if not openable:
+                # Never leave an XML-injected HWPX for users when Hancom rejects it.
+                shutil.copy2(src, dst)
+                fallback_openable, fallback_message = validate_hwpx_with_hancom(dst)
+                result.update({
+                    "inserted": [],
+                    "missing": [finding.anchor_text for finding in file_findings],
+                    "fallback_original": True,
+                    "fallback_open_test": fallback_message,
+                })
+                if not fallback_openable:
+                    dst.unlink(missing_ok=True)
+                    result["output"] = None
+                    result["error"] = "원본 HWPX도 한글 열기 검사에 실패하여 메모본을 생성하지 않았습니다."
             summary.append(result)
         (out_dir / "assessment_memo_creation_summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2),
@@ -190,6 +207,31 @@ class ReviewRunner:
                 continue
             filtered.append(path)
         return sorted(filtered)
+
+
+def validate_hwpx_with_hancom(path: Path) -> tuple[bool, str]:
+    """Open a generated HWPX in Hancom before exposing it to users."""
+    try:
+        from pyhwpx import Hwp
+    except Exception as exc:
+        return False, f"한글 열기 검사 모듈을 불러오지 못함: {exc}"
+
+    hwp = None
+    try:
+        hwp = Hwp(new=True, visible=False, register_module=True)
+        opened = bool(hwp.open(str(path), format="HWPX", arg="forceopen:true"))
+        if opened:
+            hwp.close(is_dirty=False)
+            return True, "정상"
+        return False, "한글에서 문서를 열지 못함"
+    except Exception as exc:
+        return False, f"한글 열기 검사 오류: {exc}"
+    finally:
+        if hwp is not None:
+            try:
+                hwp.quit(save=False)
+            except Exception:
+                pass
 
 
 def is_generated_review_file(path: Path) -> bool:
@@ -485,6 +527,7 @@ class RuleEngine:
         self._check_subject_achievement_level()
         self._check_performance_detail_scores()
         self._check_performance_area_name_consistency()
+        self._check_performance_element_consistency()
         self._check_performance_linkage_presence()
         self._check_basic_scores()
         self._check_obvious_score_inversions()
@@ -636,6 +679,8 @@ class RuleEngine:
                     ],
                     context=ratio_source[:1800],
                 )
+
+        self._check_performance_score_ratio_consistency(overview_items, ratio_source)
         if not overview_items:
             for point, percent in POINT_PERCENT_RE.findall(ratio_source):
                 p = float(percent)
@@ -655,6 +700,46 @@ class RuleEngine:
                 # Look for common final total error without overfitting every sub-percent.
                 if "100%" not in ratio_section:
                     self.add("상", "반영비율 합계 확인", "합계", ["정기시험+수행평가 합계 100% 여부 확인"])
+
+    def _check_performance_score_ratio_consistency(
+        self,
+        items: list[AssessmentOverviewItem],
+        source_text: str,
+    ) -> None:
+        """Recalculate a performance-only overview instead of trusting its printed total."""
+        if not items or "정기시험" in source_text:
+            return
+        complete = [item for item in items if item.score is not None and item.ratio is not None]
+        if len(complete) != len(items):
+            return
+
+        score_total = sum(int(item.score or 0) for item in complete)
+        ratio_total = sum(float(item.ratio or 0) for item in complete)
+        mismatches = [item for item in complete if abs(float(item.score or 0) - float(item.ratio or 0)) > 0.001]
+        for item in mismatches:
+            self.add(
+                "상",
+                "수행평가 점수·반영비율 불일치",
+                item.raw_score or item.name,
+                [
+                    f"{item.name}이(가) {item.score:g}점({item.ratio:g}%)으로 점수와 반영비율이 서로 다름",
+                    f"평가요소 점수 합계: {score_total:g}점 / 괄호 안 반영비율 합계: {ratio_total:g}%",
+                    "각 평가요소의 점수와 반영비율을 일치시키고 전체 합계를 100으로 조정",
+                ],
+                context=item.source,
+            )
+
+        if not mismatches and (score_total != 100 or abs(ratio_total - 100) > 0.001):
+            self.add(
+                "상",
+                "수행평가 합계 불일치",
+                "100%",
+                [
+                    f"평가요소 점수 합계: {score_total:g}점 / 괄호 안 반영비율 합계: {ratio_total:g}%",
+                    "표에 적힌 합계값이 아니라 개별 평가요소를 다시 합산하여 100점(100%)으로 조정",
+                ],
+                context=source_text[:1800],
+            )
 
     def _check_consulting_ratio_rules(self) -> None:
         section = sector_text(self.doc, "assessment_overview", "4. 평가의 종류", "5.")
@@ -779,22 +864,22 @@ class RuleEngine:
         if not ratio_scores:
             return
         if self.doc.table_rows:
-            detail_blocks = performance_detail_blocks_from_tables(self.doc.table_rows)
-            for block in detail_blocks:
-                expected = match_ratio_score(block["name"], ratio_scores)
+            detail_items = performance_detail_relation_items(self.doc)
+            for item in detail_items:
+                expected = match_ratio_score(str(item["name"]), ratio_scores)
                 if expected is None:
                     continue
-                detail_score = block["score"]
+                detail_score = int(item.get("score", 0) or 0)
                 if not detail_score:
                     self.add(
                         "상",
                         "수행평가 영역 만점 누락",
-                        str(block["name"]),
+                        str(item["name"]),
                         [
-                            f"4번 평가 종류 표의 '{block['name']}' 영역 만점은 {expected}점이나, 6번 수행평가 세부기준의 영역 만점이 비어 있음",
+                            f"4번 평가 종류 표의 '{item['name']}' 영역 만점은 {expected}점이나, 6번 수행평가 세부기준의 영역 만점이 비어 있음",
                             "6번 수행평가 세부기준에 영역 만점을 입력",
                         ],
-                        context=table_rows_text(block["rows"][:4]),
+                        context=str(item.get("context", ""))[:1800],
                     )
                     continue
                 if detail_score != expected:
@@ -806,7 +891,7 @@ class RuleEngine:
                             f"4번 평가 종류 표의 영역 만점은 {expected}점이나, 6번 수행평가 세부기준은 {detail_score}점으로 표기",
                             "4번 영역 만점과 6번 세부기준 만점을 일치시켜 수정",
                         ],
-                        context=table_rows_text(block["rows"][:10]),
+                        context=str(item.get("context", ""))[:1800],
                     )
             return
 
@@ -831,6 +916,19 @@ class RuleEngine:
         if not ratio_names or not detail_names:
             return
         normalized_details = {normalize_area_name(name) for name in detail_names}
+        normalized_ratios = [normalize_area_name(name) for name in ratio_names if normalize_area_name(name)]
+        matched_ratio_count = sum(
+            1
+            for name in normalized_ratios
+            if name in normalized_details or any(name in detail or detail in name for detail in normalized_details)
+        )
+        # When none of the names match, the parser likely selected a merged upper
+        # category (for example, "감상/표현") or evaluation-element row.
+        if (
+            matched_ratio_count == 0
+            and (len(normalized_ratios) > 1 or len(normalized_details) > 1)
+        ) or len(normalized_ratios) > len(normalized_details) * 2:
+            return
         for ratio_name in ratio_names:
             normalized = normalize_area_name(ratio_name)
             if not normalized or normalized in normalized_details:
@@ -846,6 +944,57 @@ class RuleEngine:
                     "4번 반영비율 표와 6번 수행평가 세부기준의 평가영역명을 같은 명칭으로 수정",
                 ],
                 context=(sector_text(self.doc, "assessment_overview", "4. 평가의 종류", "5.") + "\n" + sector_text(self.doc, "performance_detail", "6. 수행평가", "7."))[:2000],
+            )
+
+    def _check_performance_element_consistency(self) -> None:
+        overview_items = assessment_overview_element_items(self.doc)
+        detail_items = performance_detail_element_items(self.doc)
+        if not overview_items or not detail_items:
+            return
+
+        detail_by_name = {
+            normalize_area_name(str(item["name"])): item
+            for item in detail_items
+            if normalize_area_name(str(item["name"]))
+        }
+        for overview in overview_items:
+            area_name = str(overview["name"])
+            detail = match_relation_detail_by_name(area_name, detail_by_name)
+            if detail is None:
+                continue
+            overview_elements = list(overview.get("elements", []))
+            detail_elements = list(detail.get("elements", []))
+            if not detail_elements:
+                continue
+            if not overview_elements:
+                self.add(
+                    "상",
+                    "4번 평가요소 기재 누락",
+                    area_name,
+                    [
+                        f"수행평가 '{area_name}'의 4번 평가요소 칸이 비어 있거나 기호만 있어 6번 세부기준과 대조할 수 없음",
+                        "6번 세부기준의 실제 평가요소를 4번 평가요소 칸에 영역별로 요약 기재",
+                    ],
+                    context=(str(overview.get("context", "")) + "\n" + str(detail.get("context", "")))[:2400],
+                )
+                continue
+            missing = [
+                element
+                for element in overview_elements
+                if not any(evaluation_elements_match(element, candidate) for candidate in detail_elements)
+            ]
+            if not missing:
+                continue
+            self.add(
+                "상",
+                "4번-6번 평가요소 누락",
+                missing[0],
+                [
+                    f"수행평가 '{area_name}'의 4번 평가표에는 있으나 6번 세부기준에서 확인되지 않는 평가요소: "
+                    + ", ".join(missing),
+                    "6번 수행평가 세부기준의 평가요소와 채점기준에 누락된 항목을 반영",
+                ],
+                context=(str(overview.get("context", "")) + "\n" + str(detail.get("context", "")))[:2400],
             )
 
     def _check_performance_linkage_presence(self) -> None:
@@ -954,7 +1103,7 @@ class RuleEngine:
 
         overview_by_name = {
             normalize_area_name(item.name): item
-            for item in assessment_overview_items(self.doc)
+            for item in grouped_assessment_overview_items(self.doc)
             if normalize_area_name(item.name)
         }
         all_monthly_codes = set(extract_achievement_codes(plan_text))
@@ -1361,7 +1510,7 @@ def build_excel_relation_audit(document: Document) -> list[RelationAuditRow]:
     rows: list[RelationAuditRow] = []
     plan_text = sector_text(document, "monthly_plan") or monthly_plan_text(document.text)
     monthly_codes = set(extract_achievement_codes(plan_text))
-    overview_items = assessment_overview_items(document)
+    overview_items = grouped_assessment_overview_items(document)
     detail_items = performance_detail_relation_items(document)
     overview_by_name = {normalize_area_name(item.name): item for item in overview_items if normalize_area_name(item.name)}
     detail_by_name = {normalize_area_name(item["name"]): item for item in detail_items if normalize_area_name(str(item["name"]))}
@@ -1426,7 +1575,10 @@ def build_excel_relation_audit(document: Document) -> list[RelationAuditRow]:
 
             overview_codes = set(overview.achievement_codes)
             if detail_codes and overview_codes:
-                missing = sorted(detail_codes - overview_codes)
+                # Only flag standards announced in section 4 but omitted from
+                # the matching section 6 detail. Extra detail-side codes can
+                # come from merged cells or a neighboring performance area.
+                missing = sorted(overview_codes - detail_codes)
                 status = "Pass" if not missing else "Fail"
                 rows.append(
                     RelationAuditRow(
@@ -1437,9 +1589,9 @@ def build_excel_relation_audit(document: Document) -> list[RelationAuditRow]:
                         ", ".join(sorted(detail_codes)),
                         status,
                         (
-                            "6번 수행평가 성취기준이 4번 평가표 성취기준 안에서 확인됨"
+                            "4번 평가표의 수행평가 성취기준이 6번 세부기준에서 확인됨"
                             if status == "Pass"
-                            else f"6번 성취기준 중 4번 평가표에서 확인되지 않는 코드: {', '.join(missing)}"
+                            else f"4번 평가표 성취기준 중 6번 세부기준에서 확인되지 않는 코드: {', '.join(missing)}"
                         ),
                         "상" if status == "Fail" else "하",
                         context,
@@ -1585,11 +1737,11 @@ def build_excel_relation_audit(document: Document) -> list[RelationAuditRow]:
 
 
 def performance_detail_relation_items(document: Document) -> list[dict[str, object]]:
+    raw_items: list[dict[str, object]] = []
     if document.table_rows:
-        table_items: list[dict[str, object]] = []
         for block in performance_detail_blocks_from_tables(document.table_rows):
             context = table_rows_text(block.get("rows", []))  # type: ignore[arg-type]
-            table_items.append(
+            raw_items.append(
                 {
                     "name": str(block.get("name", "")),
                     "score": int(block.get("score", 0) or 0),
@@ -1597,14 +1749,170 @@ def performance_detail_relation_items(document: Document) -> list[dict[str, obje
                     "context": context,
                 }
             )
-        if table_items:
-            return table_items
+    if not raw_items:
+        section = sector_text(document, "performance_detail", "6. 수행평가", "7.")
+        raw_items = [
+            {"name": name, "score": score, "codes": set(extract_achievement_codes(context)), "context": context}
+            for name, score, context in extract_performance_text_detail_items(section)
+        ]
 
-    section = sector_text(document, "performance_detail", "6. 수행평가", "7.")
+    grouped: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    seen_items: set[tuple[str, int, str]] = set()
+    for item in raw_items:
+        key = normalize_area_name(str(item.get("name", "")))
+        if not key:
+            continue
+        context = str(item.get("context", ""))
+        signature = (key, int(item.get("score", 0) or 0), re.sub(r"\s+", "", context))
+        if signature in seen_items:
+            continue
+        seen_items.add(signature)
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = {"name": item["name"], "score": 0, "codes": set(), "contexts": []}
+        group = grouped[key]
+        group["score"] = int(group["score"]) + int(item.get("score", 0) or 0)
+        group["codes"].update(item.get("codes", set()))  # type: ignore[union-attr]
+        if context and context not in group["contexts"]:  # type: ignore[operator]
+            group["contexts"].append(context)  # type: ignore[union-attr]
     return [
-        {"name": name, "score": score, "codes": set(extract_achievement_codes(context)), "context": context}
-        for name, score, context in extract_performance_text_detail_items(section)
+        {
+            "name": grouped[key]["name"],
+            "score": grouped[key]["score"],
+            "codes": grouped[key]["codes"],
+            "context": "\n".join(grouped[key]["contexts"]),  # type: ignore[arg-type]
+        }
+        for key in order
     ]
+
+
+def split_evaluation_elements(text: str) -> list[str]:
+    cleaned = clean_cell(text)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    parts = re.split(r"\s*[∙·•▪◆▶▸]\s*|\s*[;；]\s*|\n+", cleaned)
+    result: list[str] = []
+    for part in parts:
+        part = clean_cell(part).strip("-–—:： ")
+        if len(normalize_area_name(part)) < 3:
+            continue
+        if part not in result:
+            result.append(part)
+    return result
+
+
+def assessment_overview_element_items(document: Document) -> list[dict[str, object]]:
+    rows = assessment_ratio_table_rows(document) or document.table_rows
+    if not rows:
+        return []
+    kind_index = next(
+        (index for index, row in enumerate(rows) if row and "평가종류" in re.sub(r"\s+", "", clean_cell(row[0]))),
+        None,
+    )
+    if kind_index is None:
+        return []
+    performance_columns = [
+        index
+        for index, cell in enumerate(rows[kind_index])
+        if index > 0 and "수행평가" in re.sub(r"\s+", "", clean_cell(cell))
+    ]
+    if not performance_columns:
+        return []
+    score_index = next(
+        (
+            index
+            for index in range(kind_index + 1, min(len(rows), kind_index + 12))
+            if rows[index] and "영역만점" in re.sub(r"\s+", "", clean_cell(rows[index][0]))
+        ),
+        None,
+    )
+    element_index = next(
+        (
+            index
+            for index in range(kind_index + 1, min(len(rows), kind_index + 15))
+            if rows[index] and re.sub(r"\s+", "", clean_cell(rows[index][0])).startswith("평가요소")
+        ),
+        None,
+    )
+    if element_index is None:
+        return []
+
+    area_rows = rows[kind_index + 1 : score_index if score_index is not None else element_index]
+    result: list[dict[str, object]] = []
+    for column in performance_columns:
+        names: list[str] = []
+        for row in area_rows:
+            label = re.sub(r"\s+", "", clean_cell(row[0])) if row else ""
+            if "시기/영역" not in label or column >= len(row):
+                continue
+            candidate = clean_cell(row[column])
+            if is_valid_performance_area_name(candidate):
+                names.append(candidate)
+        area_name = names[-1] if names else ""
+        element_text = clean_cell(rows[element_index][column]) if column < len(rows[element_index]) else ""
+        # Some school forms place achievement standards in a row headed
+        # "평가 요소 및 관련 성취기준". Do not compare those sentences as elements.
+        elements = [] if extract_achievement_codes(element_text) else split_evaluation_elements(element_text)
+        if area_name:
+            result.append(
+                {
+                    "name": area_name,
+                    "elements": elements,
+                    "context": f"평가영역: {area_name}\n평가요소: {element_text}",
+                }
+            )
+    return result
+
+
+def performance_detail_element_items(document: Document) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for block in performance_detail_blocks_from_tables(document.table_rows):
+        block_rows = list(block.get("rows", []))  # type: ignore[arg-type]
+        header_index = next(
+            (
+                index
+                for index, row in enumerate(block_rows)
+                if row
+                and re.sub(r"\s+", "", clean_cell(row[0])).startswith("평가요소")
+                and any("배점" in re.sub(r"\s+", "", clean_cell(cell)) for cell in row)
+            ),
+            None,
+        )
+        if header_index is None:
+            continue
+        elements: list[str] = []
+        for row in block_rows[header_index + 1 :]:
+            if not row:
+                continue
+            name = clean_cell(row[0])
+            compact = re.sub(r"\s+", "", name)
+            if compact.startswith((
+                "기본점수", "채점기준을", "평가요소중", "모든항목", "모든평가요소",
+                "백지", "본인의의사", "자발적", "학업성적관리규정", "장기미인정", "<유의사항>", "유의사항",
+            )):
+                continue
+            if not any(re.search(r"(?<!\d)\d{1,3}(?:\s*\(\s*기본점수\s*\))?(?!\d)", clean_cell(cell)) for cell in row[1:]):
+                continue
+            if len(normalize_area_name(name)) >= 3 and name not in elements:
+                elements.append(name)
+        name = str(block.get("name", ""))
+        signature = (normalize_area_name(name), tuple(normalize_area_name(item) for item in elements))
+        if not signature[0] or not elements or signature in seen:
+            continue
+        seen.add(signature)
+        result.append({"name": name, "elements": elements, "context": table_rows_text(block_rows)})
+    return result
+
+
+def evaluation_elements_match(left: str, right: str) -> bool:
+    left_normalized = normalize_area_name(left)
+    right_normalized = normalize_area_name(right)
+    if not left_normalized or not right_normalized:
+        return False
+    if left_normalized in right_normalized or right_normalized in left_normalized:
+        return True
+    return SequenceMatcher(None, left_normalized, right_normalized).ratio() >= 0.72
 
 
 def match_relation_detail_by_name(name: str, detail_by_name: dict[str, dict[str, object]]) -> dict[str, object] | None:
@@ -2485,7 +2793,8 @@ def parse_period_weeks(period: str) -> list[tuple[int, int]]:
     if not compact or "수시" in compact or "중" in compact:
         return []
 
-    cross_month = re.search(r"([3-9]|1[0-2])월([1-5])주~([3-9]|1[0-2])월([1-5])주", compact)
+    range_mark = r"[~∼\-–—]"
+    cross_month = re.search(rf"([3-9]|1[0-2])월([1-5])주{range_mark}([3-9]|1[0-2])월([1-5])주", compact)
     if cross_month:
         start_month, start_week, end_month, end_week = map(int, cross_month.groups())
         return expand_week_range(start_month, start_week, end_month, end_week)
@@ -2494,7 +2803,7 @@ def parse_period_weeks(period: str) -> list[tuple[int, int]]:
     if len(explicit_pairs) > 1:
         return explicit_pairs
 
-    same_month = re.search(r"([3-9]|1[0-2])월([1-5])(?:~([1-5]))?주", compact)
+    same_month = re.search(rf"([3-9]|1[0-2])월([1-5])(?:{range_mark}([1-5]))?주", compact)
     if same_month:
         month = int(same_month.group(1))
         start = int(same_month.group(2))
@@ -2893,6 +3202,59 @@ def assessment_overview_items(doc: Document) -> list[AssessmentOverviewItem]:
     if row_items and (any(item.period for item in row_items) or not text_items):
         return row_items
     return text_items or row_items
+
+
+def grouped_assessment_overview_items(doc: Document) -> list[AssessmentOverviewItem]:
+    """Combine subcolumns that share one merged performance-area heading."""
+    grouped: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    for item in assessment_overview_items(doc):
+        key = normalize_area_name(item.name)
+        if not key:
+            continue
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = {
+                "name": item.name,
+                "scores": [],
+                "ratios": [],
+                "codes": set(),
+                "periods": [],
+                "sources": [],
+                "raw_scores": [],
+                "confidence": item.confidence,
+            }
+        group = grouped[key]
+        if item.score is not None:
+            group["scores"].append(item.score)  # type: ignore[union-attr]
+        if item.ratio is not None:
+            group["ratios"].append(item.ratio)  # type: ignore[union-attr]
+        group["codes"].update(item.achievement_codes)  # type: ignore[union-attr]
+        if item.period and item.period not in group["periods"]:  # type: ignore[operator]
+            group["periods"].append(item.period)  # type: ignore[union-attr]
+        if item.source and item.source not in group["sources"]:  # type: ignore[operator]
+            group["sources"].append(item.source)  # type: ignore[union-attr]
+        if item.raw_score:
+            group["raw_scores"].append(item.raw_score)  # type: ignore[union-attr]
+
+    result: list[AssessmentOverviewItem] = []
+    for key in order:
+        group = grouped[key]
+        scores = group["scores"]
+        ratios = group["ratios"]
+        result.append(
+            AssessmentOverviewItem(
+                str(group["name"]),
+                sum(ratios) if ratios else None,  # type: ignore[arg-type]
+                sum(scores) if scores else None,  # type: ignore[arg-type]
+                tuple(sorted(group["codes"])),  # type: ignore[arg-type]
+                ", ".join(group["periods"]),  # type: ignore[arg-type]
+                "\n".join(group["sources"]),  # type: ignore[arg-type]
+                str(group["confidence"]),
+                " + ".join(group["raw_scores"]),  # type: ignore[arg-type]
+            )
+        )
+    return result
 
 
 def match_overview_item_by_name(name: str, overview_by_name: dict[str, AssessmentOverviewItem]) -> AssessmentOverviewItem | None:
@@ -3354,7 +3716,17 @@ def is_valid_performance_area_name(value: str) -> bool:
 
 
 def performance_area_percentages_from_ratio(doc: Document) -> list[tuple[str, float]]:
-    items = assessment_overview_items(doc)
+    raw_items = assessment_overview_items(doc)
+    detail_names = {normalize_area_name(name) for name in performance_detail_area_names(doc)}
+    repeated_names = {
+        normalize_area_name(item.name)
+        for item in raw_items
+        if sum(1 for candidate in raw_items if normalize_area_name(candidate.name) == normalize_area_name(item.name)) > 1
+    }
+    should_group = bool(repeated_names) and (
+        not detail_names or any(name in detail_names for name in repeated_names)
+    )
+    items = grouped_assessment_overview_items(doc) if should_group else raw_items
     if items:
         return [(item.name, item.ratio) for item in items if item.ratio is not None]
     names = performance_area_names_from_ratio(doc)
@@ -3394,7 +3766,7 @@ def performance_area_percentages_from_ratio(doc: Document) -> list[tuple[str, fl
 
 def performance_area_scores_from_ratio(rows: list[list[str]], doc: Document | None = None) -> dict[str, int]:
     if doc is not None:
-        items = assessment_overview_items(doc)
+        items = grouped_assessment_overview_items(doc)
         if items:
             return {normalize_area_name(item.name): item.score for item in items if item.score is not None}
     names = table_row_text_cells(rows, "시기/영역")
@@ -3563,7 +3935,9 @@ def extract_basic_score_rows_from_tables(
     for block in performance_detail_blocks_from_tables(rows):
         block_rows = block["rows"]  # type: ignore[assignment]
         detail_score = int(block["score"])
-        full_score = match_ratio_score(str(block["name"]), ratio_scores) or detail_score
+        # A repeated section-6 area can contain one sub-element table at a time.
+        # Its own printed score is the correct denominator for that table's base score.
+        full_score = detail_score or match_ratio_score(str(block["name"]), ratio_scores) or 0
         for row in block_rows:
             joined = " ".join(row)
             if not is_overall_basic_score_row(row):

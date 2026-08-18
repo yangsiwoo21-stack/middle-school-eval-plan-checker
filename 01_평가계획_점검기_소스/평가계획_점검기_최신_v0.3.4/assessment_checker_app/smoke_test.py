@@ -6,6 +6,8 @@ from checker import (
     RuleEngine,
     achievement_first_appearance_lines,
     assessment_overview_items_from_rows,
+    grouped_assessment_overview_items,
+    assessment_overview_element_items,
     comparable_interval_scores,
     extract_achievement_codes,
     is_consulting_period_format,
@@ -13,6 +15,7 @@ from checker import (
     learned_codes_before_or_by_period,
     performance_area_names_from_ratio_rows,
     performance_detail_blocks_from_tables,
+    performance_detail_element_items,
     periods_from_overview_text,
     split_combined_subject_document,
 )
@@ -67,8 +70,84 @@ def main() -> None:
     ]
     assert overview_items[0].achievement_codes == ("[9진로01-01]",)
 
+    repeated_area_rows = [
+        ["평가 종류", "수행평가", "수행평가", "수행평가", "수행평가", "수행평가", "수행평가", "합계"],
+        ["시기/영역", "컴퓨팅 시스템", "컴퓨팅 시스템", "프로그램 구현", "프로그램 구현", "인공지능 시스템", "인공지능 시스템", ""],
+        ["시기/영역", "요소1", "요소2", "요소3", "요소4", "요소5", "요소6", ""],
+        ["영역 만점 (반영비율)", "10점 (10%)", "20점 (20%)", "15점 (15%)", "20점 (15%)", "15점 (15%)", "20점 (20%)", "100%"],
+        ["성취기준", "[9정01-01]", "[9정01-02]", "[9정03-06]", "[9정03-07]", "[9정04-02]", "[9정04-03]", ""],
+        ["평가 시기", "9월 1주", "9월 1주", "10월 3주", "10월 3주", "11월 4주", "11월 4주", ""],
+    ]
+    repeated_document = Document(
+        Path("2026학년도 2학기 1학년 정보과.hwpx"),
+        "4. 평가의 종류와 반영비율\n5. 성취율과 성취도",
+        None,
+        grade=1,
+        subject="정보",
+        table_rows=repeated_area_rows,
+    )
+    grouped_items = grouped_assessment_overview_items(repeated_document)
+    assert [(item.name, item.score, item.ratio) for item in grouped_items] == [
+        ("컴퓨팅 시스템", 30, 30.0),
+        ("프로그램 구현", 35, 30.0),
+        ("인공지능 시스템", 35, 35.0),
+    ]
+    repeated_findings = RuleEngine(repeated_document).run()
+    assert any(f.topic == "수행평가 점수·반영비율 불일치" and "20점 (15%)" in f.anchor_text for f in repeated_findings)
+    assert any(f.topic == "수행평가 한 영역 30% 초과" and "인공지능 시스템" in f.memo_text for f in repeated_findings)
+
+    element_rows = [
+        ["평가 종류", "수행평가"],
+        ["시기/영역", "기하학 논술"],
+        ["시기/영역", "삼각형의 작도와 합동의 원리 설명하기"],
+        ["영역 만점 (반영비율)", "15점 (15%)"],
+        ["평가 요소", "∙ 삼각형 작도하기 · 작도 조건 제시하기 · 합동조건으로 문제 해결하기"],
+        ["평가 시기", "10월 1주"],
+        ["평가 영역명", "삼각형의 작도와 합동의 원리 설명하기", "영역 만점", "15"],
+        ["평가 요소", "수행 수준(채점기준)", "배점"],
+        ["삼각형 작도하기", "정확히 작도함", "5"],
+        ["합동조건으로 문제 해결하기", "문제를 해결함", "5"],
+        ["기본점수", "수행함", "3"],
+    ]
+    element_document = Document(
+        Path("2026학년도 2학기 1학년 수학과.hwpx"),
+        "4. 평가의 종류와 반영비율\n6. 수행평가 세부기준",
+        None,
+        grade=1,
+        subject="수학",
+        table_rows=element_rows,
+    )
+    assert assessment_overview_element_items(element_document)[0]["elements"] == [
+        "삼각형 작도하기",
+        "작도 조건 제시하기",
+        "합동조건으로 문제 해결하기",
+    ]
+    assert performance_detail_element_items(element_document)[0]["elements"] == [
+        "삼각형 작도하기",
+        "합동조건으로 문제 해결하기",
+    ]
+    assert any(
+        finding.topic == "4번-6번 평가요소 누락" and "작도 조건 제시하기" in finding.memo_text
+        for finding in RuleEngine(element_document).run()
+    )
+
     detail_rows = [["평가 영역명", "발표하기", "영역 만점", "", "학기", "2학기"]]
     assert performance_detail_blocks_from_tables(detail_rows)[0]["score"] == 0
+    missing_score_rows = [
+        ["평가 영역명", "가치 수직선 기반 1분 쇼츠 설득하기"],
+        ["평가 요소", "채점 기준", "배점"],
+        ["표현하기 (5점)", "기준을 충족함", "5"],
+        ["기본점수 (백지답안지 제출자 포함)", "", "2"],
+    ]
+    missing_score_document = Document(
+        Path("2026학년도 2학기 3학년 국어과.hwpx"),
+        "6. 수행평가 세부기준",
+        None,
+        grade=3,
+        subject="국어",
+        table_rows=missing_score_rows,
+    )
+    RuleEngine(missing_score_document).run()
     merged_detail_rows = [
         ["평가 영역명", "평가 영역명", "세계 유명 건물 소개하기", "세계 유명 건물 소개하기", "영역 만점", "20", "학기", "2학기"],
         ["교육과정 성취기준", "[9영04-01]"],
@@ -98,6 +177,7 @@ def main() -> None:
     ]
     split_period_text = "정기시험\n평가 시기\n12월 2주\n9월 2주~10월 3주\n9월 4주~11월\n2주"
     assert periods_from_overview_text(split_period_text, 2)[-1] == "9월 4주~11월 2주"
+    assert learned_codes_before_or_by_period("", "9월 2-3주", merged_month_rows) == {"[9수03-03]"}
 
     timing_rows = [
         ["9", "1", "단원", "[9국03-07] 복합양식을 활용한다."],
@@ -178,7 +258,7 @@ def main() -> None:
             ["교육과정 성취기준", "[9과21-01] [9과21-02]"],
         ],
     )
-    assert any(
+    assert not any(
         f.topic == "4번-6번 수행평가 성취기준 불일치"
         for f in RuleEngine(code_mismatch).run()
     )
